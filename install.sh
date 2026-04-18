@@ -303,7 +303,131 @@ ok "run.sh, daily_digest.py, uninstall.sh marked executable"
 
 
 # ---------------------------------------------------------------------------
-# 8. Install launchd plist
+# 8. Pick a run time + check for conflicts with other scheduled jobs
+# ---------------------------------------------------------------------------
+say "Scheduled run time"
+
+DEFAULT_HOUR=2
+DEFAULT_MINUTE=0
+
+# If we're re-installing, keep the previous schedule as the default rather
+# than forcing the user back to 02:00.
+if [[ -f "$LAUNCHD_PLIST" ]]; then
+    prev_hour=$(/usr/libexec/PlistBuddy -c "Print :StartCalendarInterval:Hour" "$LAUNCHD_PLIST" 2>/dev/null || echo "")
+    prev_min=$(/usr/libexec/PlistBuddy -c "Print :StartCalendarInterval:Minute" "$LAUNCHD_PLIST" 2>/dev/null || echo "")
+    [[ -n "$prev_hour" ]] && DEFAULT_HOUR="$prev_hour"
+    [[ -n "$prev_min"  ]] && DEFAULT_MINUTE="$prev_min"
+fi
+
+# --- Show what's already scheduled, so the user can avoid clashes ---
+echo "  Currently scheduled jobs on this user account:"
+found_any=false
+# Other LaunchAgents belonging to this user.
+shopt -s nullglob
+for pl in "$HOME/Library/LaunchAgents"/*.plist; do
+    [[ "$pl" == "$LAUNCHD_PLIST" ]] && continue
+    label=$(/usr/libexec/PlistBuddy -c "Print :Label" "$pl" 2>/dev/null || echo "?")
+    h=$(/usr/libexec/PlistBuddy -c "Print :StartCalendarInterval:Hour"   "$pl" 2>/dev/null || true)
+    m=$(/usr/libexec/PlistBuddy -c "Print :StartCalendarInterval:Minute" "$pl" 2>/dev/null || true)
+    if [[ -n "$h" && -n "$m" ]]; then
+        printf "    • %s — LaunchAgent %s\n" "$(printf '%02d:%02d' "$h" "$m")" "$label"
+        found_any=true
+    fi
+done
+shopt -u nullglob
+# User crontab.
+if crontab -l 2>/dev/null | grep -vE '^\s*(#|$)' | head -20 | awk 'NF>=5' | while read -r min hr rest; do
+    case "$min" in *[!0-9]*) continue;; esac
+    case "$hr"  in *[!0-9]*) continue;; esac
+    printf "    • %02d:%02d — crontab: %s\n" "$hr" "$min" "$rest"
+done | grep -q .; then
+    found_any=true
+fi
+# pmset wake schedule (system-wide).
+pmset_line=$(pmset -g sched 2>/dev/null | awk '/wake/{print; exit}')
+if [[ -n "$pmset_line" ]]; then
+    echo "    • system wake: $pmset_line"
+    found_any=true
+fi
+$found_any || echo "    (none found — you'll be the first)"
+echo ""
+
+# Collect busy times once: minute-of-day for every other LaunchAgent
+# scheduled with a StartCalendarInterval. We'll use this both to flag
+# clashes and to propose a clash-free alternative.
+busy_mins=()
+shopt -s nullglob
+for pl in "$HOME/Library/LaunchAgents"/*.plist; do
+    [[ "$pl" == "$LAUNCHD_PLIST" ]] && continue
+    h=$(/usr/libexec/PlistBuddy -c "Print :StartCalendarInterval:Hour"   "$pl" 2>/dev/null || true)
+    m=$(/usr/libexec/PlistBuddy -c "Print :StartCalendarInterval:Minute" "$pl" 2>/dev/null || true)
+    [[ -n "$h" && -n "$m" ]] && busy_mins+=( "$(( 10#$h * 60 + 10#$m )):$(/usr/libexec/PlistBuddy -c "Print :Label" "$pl" 2>/dev/null || echo "?")" )
+done
+shopt -u nullglob
+
+_clash_labels() {   # $1 = candidate minute-of-day; prints any clashes
+    local cand=$1 entry other_m lbl diff
+    for entry in "${busy_mins[@]}"; do
+        other_m=${entry%%:*}; lbl=${entry#*:}
+        diff=$(( cand - other_m )); diff=${diff#-}
+        if (( diff <= 15 )); then
+            printf '      - LaunchAgent at %02d:%02d: %s\n' \
+                "$(( other_m / 60 ))" "$(( other_m % 60 ))" "$lbl"
+        fi
+    done
+}
+
+_next_free_slot() {   # $1 = starting minute-of-day; prints first clash-free slot
+    local start=$1 cand i
+    for (( i=0; i<96; i++ )); do   # search up to 24h in 15-min steps
+        cand=$(( (start + i * 15) % 1440 ))
+        if [[ -z "$(_clash_labels "$cand")" ]]; then
+            echo "$cand"; return 0
+        fi
+    done
+    echo "$start"
+}
+
+# --- Ask for time, warn on clash, and offer a clash-free default ---
+input_default=$(printf '%02d:%02d' "$DEFAULT_HOUR" "$DEFAULT_MINUTE")
+while true; do
+    read -r -p "  What time should the digest run? [HH:MM, default $input_default] " t_input
+    t_input="${t_input:-$input_default}"
+    if [[ ! "$t_input" =~ ^([0-9]{1,2}):([0-9]{2})$ ]]; then
+        warn "expected HH:MM (e.g. 02:00, 07:30)"; continue
+    fi
+    HOUR=$((10#${BASH_REMATCH[1]}))
+    MINUTE=$((10#${BASH_REMATCH[2]}))
+    if (( HOUR < 0 || HOUR > 23 || MINUTE < 0 || MINUTE > 59 )); then
+        warn "hour must be 0-23, minute must be 0-59"; continue
+    fi
+
+    chosen_mins=$(( HOUR * 60 + MINUTE ))
+    clash="$(_clash_labels "$chosen_mins")"
+    if [[ -n "$clash" ]]; then
+        warn "another scheduled job fires within ±15 minutes of $(printf '%02d:%02d' "$HOUR" "$MINUTE"):"
+        printf '%s' "$clash"
+        # Auto-suggest the next free slot from chosen+30 min so we don't
+        # just re-hit the clashing window.
+        suggested=$(_next_free_slot $(( (chosen_mins + 30) % 1440 )))
+        sug_str=$(printf '%02d:%02d' "$(( suggested / 60 ))" "$(( suggested % 60 ))")
+        read -r -p "      Use $sug_str instead? [Y/n] " accept
+        if [[ -z "$accept" || "$accept" =~ ^[Yy] ]]; then
+            HOUR=$(( suggested / 60 )); MINUTE=$(( suggested % 60 ))
+            ok "shifted to $sug_str to avoid the clash"
+            break
+        fi
+        # User said no — re-prompt, defaulting to their original pick.
+        input_default="$t_input"
+        continue
+    fi
+    break
+done
+ok "scheduled run time: $(printf '%02d:%02d' "$HOUR" "$MINUTE") daily"
+
+
+# ---------------------------------------------------------------------------
+# 9. Install launchd plist
 # ---------------------------------------------------------------------------
 say "Installing launchd agent"
 
@@ -318,6 +442,8 @@ fi
 # Render template
 sed -e "s|__REPO_DIR__|$REPO_DIR|g" \
     -e "s|__LOG_DIR__|$LOG_DIR|g" \
+    -e "s|__HOUR__|$HOUR|g" \
+    -e "s|__MINUTE__|$MINUTE|g" \
     "$REPO_DIR/com.user.dailydigest.plist.template" \
     > "$LAUNCHD_PLIST"
 
@@ -326,7 +452,7 @@ ok "agent installed and loaded ($LAUNCHD_PLIST)"
 
 
 # ---------------------------------------------------------------------------
-# 9. First run to trigger permission prompts
+# 10. First run to trigger permission prompts
 # ---------------------------------------------------------------------------
 say "First run — expect macOS permission prompts"
 
@@ -352,22 +478,34 @@ fi
 
 
 # ---------------------------------------------------------------------------
-# 10. Remind about Full Disk Access
+# 11. Remind about Full Disk Access
 # ---------------------------------------------------------------------------
+# Suggest a pmset wake a minute before the scheduled run.
+wake_mins=$(( HOUR * 60 + MINUTE - 1 ))
+(( wake_mins < 0 )) && wake_mins=$(( wake_mins + 1440 ))
+wake_hh=$(( wake_mins / 60 ))
+wake_mm=$(( wake_mins % 60 ))
+wake_str=$(printf '%02d:%02d:00' "$wake_hh" "$wake_mm")
+sched_str=$(printf '%02d:%02d' "$HOUR" "$MINUTE")
+
 cat <<EOF
 
 ${B}Two things left, both manual:${N}
 
-1. ${B}Full Disk Access${N} (required for the 02:00 launchd run to work
-   unattended when you're not logged in at the terminal):
+1. ${B}Full Disk Access${N} (required for the scheduled $sched_str launchd run
+   to work unattended when you're not logged in at the terminal):
 
        System Settings → Privacy & Security → Full Disk Access
        → '+' → /bin/bash
 
-2. ${B}Wake the Mac at 02:00${N} (optional; if you skip this the digest
+2. ${B}Wake the Mac at $sched_str${N} (optional; if you skip this the digest
    fires on next wake instead of waking the Mac itself):
 
-       sudo pmset repeat wake MTWRFSU 01:59:00
+       sudo pmset repeat wake MTWRFSU $wake_str
+
+   (Check current schedule with 'pmset -g sched'; cancel with
+   'sudo pmset repeat cancel'. pmset stores only one schedule, so
+   setting this overrides any existing repeat-wake.)
 
 ${B}Useful commands:${N}
    $REPO_DIR/run.sh --dry-run         # preview any time

@@ -1,5 +1,9 @@
 # daily-digest
 
+> ### 🖥 macOS only
+>
+> This repo is written **for macOS** (tested on macOS 13+). It uses AppleScript, `launchd`, the macOS Keychain, and the Apple Mail/Messages local stores — none of which exist on Linux or Windows. A Linux port would need: `launchd` → `systemd --user` timer or `cron`; Keychain → `secret-tool` or `pass`; AppleScript calendar → CalDAV/ICS or a Google Calendar API client; Apple Mail → drop entirely or replace with IMAP accounts; iMessage → drop entirely. The Gmail IMAP + Anthropic + SMTP paths are already portable. If you do port it, please open an issue so others can find your fork.
+
 > # 🛑 STOP — READ THIS FIRST
 >
 > **This is an exploratory / educational project.** Its purpose is to explore how to wire together the Claude API, Gmail (IMAP + SMTP), the macOS Calendar, Apple Mail, and iMessage into a single daily briefing. It is **not** a polished product, it has **not** been security-audited by anyone other than its author, and it **will change without notice**.
@@ -229,15 +233,67 @@ Each run begins by moving *its own* prior digest emails to Gmail Trash, so the i
 
 Gmail's IMAP server allows roughly 15 concurrent connections per account, and overlapping runs can also corrupt `yesterday.html`. The script takes an `fcntl` file lock on `~/.local/share/daily-digest/daily-digest.lock` at startup and exits immediately with code `4` if another copy is already running. So `launchctl start com.user.dailydigest` while a dry-run is still in progress is safe — the second invocation just quits. If you see `[ALERT] Too many simultaneous connections. (Failure)` during install, wait a minute for Gmail to time out the stale connections and try again.
 
-## Waking the Mac at 02:00
+## Checking what's already scheduled on this Mac
 
-`launchd` will not wake a sleeping Mac on its own. If you want the run to happen exactly at 02:00, schedule a wake:
+Before (or after) installing, it's worth knowing what else is running on a timer so the 02:00 digest doesn't land on top of a backup or another cron. Useful commands:
+
+**`launchd` (user-scope agents — the mechanism this tool uses):**
+
+```bash
+# List all loaded launchd jobs for your account:
+launchctl list | grep -v com.apple
+
+# Show every user LaunchAgent plist and the time each is set to fire:
+for pl in ~/Library/LaunchAgents/*.plist; do
+  label=$(/usr/libexec/PlistBuddy -c "Print :Label" "$pl" 2>/dev/null)
+  hh=$(/usr/libexec/PlistBuddy -c "Print :StartCalendarInterval:Hour" "$pl" 2>/dev/null)
+  mm=$(/usr/libexec/PlistBuddy -c "Print :StartCalendarInterval:Minute" "$pl" 2>/dev/null)
+  [ -n "$hh" ] && printf "%02d:%02d  %s\n" "$hh" "$mm" "$label"
+done | sort
+```
+
+**`launchd` (system-scope daemons — Apple and admin jobs):**
+
+```bash
+ls /Library/LaunchDaemons/ /Library/LaunchAgents/ 2>/dev/null
+```
+
+**`cron` (less common on modern macOS but still honoured):**
+
+```bash
+crontab -l           # your user's crontab
+sudo crontab -l      # root's crontab
+```
+
+**`pmset` (system-wide wake / sleep schedule):**
+
+```bash
+pmset -g sched             # show current repeat wake/sleep/shutdown
+pmset -g                   # full power-management settings
+sudo pmset repeat cancel   # remove any repeat schedule
+```
+
+The installer runs a summary of the first three for you automatically and flags anything scheduled within ±15 minutes of your chosen time.
+
+## Choosing the run time
+
+The installer asks what time you'd like the digest to fire (default 02:00) and shows any launchd agents / crontab entries / pmset wake schedules already set on the account so you can avoid a clash. If you pick a time that falls within 15 minutes of another scheduled job it warns you **and automatically suggests a clash-free slot** — press Enter to accept, or say No to keep your original pick (at your own risk).
+
+Re-running `install.sh` keeps the previous time as the default rather than resetting you to 02:00.
+
+To change the time later: re-run `./install.sh` — it reads the existing plist, shows your current time as the default, and you just type the new one.
+
+## Waking the Mac
+
+`launchd` will not wake a sleeping Mac on its own. If you want the run to happen exactly at your scheduled time, set a one-minute-earlier wake. For the default 02:00 schedule:
 
 ```bash
 sudo pmset repeat wake MTWRFSU 01:59:00
 ```
 
-Check with `pmset -g sched`; cancel with `sudo pmset repeat cancel`. If you skip this, the job simply runs on next wake, which is usually fine.
+For any other schedule, use `HH:MM:00` one minute before your launchd time. The installer prints the exact command at the end.
+
+Check with `pmset -g sched`; cancel with `sudo pmset repeat cancel`. `pmset` only stores one repeat schedule, so setting this overwrites any existing one. If you skip it entirely, the job runs on next wake — usually fine.
 
 ## How continuity works
 
