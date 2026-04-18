@@ -93,6 +93,7 @@ class CalEvent:
     location: str
     notes: str
     link: str             # calshow: URL that opens Calendar on that day
+    color: str            # calendar colour as #rrggbb
 
 @dataclass
 class MailItem:
@@ -101,7 +102,7 @@ class MailItem:
     date: str
     message_id: str
     snippet: str
-    link_mail_app: str    # message://<id>
+    link_mail_app: str    # message:<id> — Apple Mail, if Gmail is set up there
     link_gmail_web: str   # https://mail.google.com/mail/u/0/#search/rfc822msgid:<id>
 
 
@@ -120,6 +121,17 @@ on run argv
     tell application "Calendar"
         repeat with c in calendars
             set calName to name of c
+            -- Calendar colour: {r,g,b} 0-65535 per channel. Not all calendar
+            -- kinds expose it; fall back to grey.
+            try
+                set cc to color of c
+                set rC to ((item 1 of cc) div 256)
+                set gC to ((item 2 of cc) div 256)
+                set bC to ((item 3 of cc) div 256)
+                set colStr to (rC as string) & "," & (gC as string) & "," & (bC as string)
+            on error
+                set colStr to "128,128,128"
+            end try
             try
                 set evs to (every event of c whose start date ≥ startDate and start date ≤ endDate)
             on error
@@ -149,13 +161,23 @@ on run argv
                     & "|" & (ad as string) ¬
                     & "|" & calName ¬
                     & "|" & loc ¬
-                    & "|" & desc & linefeed
+                    & "|" & desc ¬
+                    & "|" & colStr & linefeed
             end repeat
         end repeat
     end tell
     return output
 end run
 """
+
+
+def _rgb_to_hex(triplet: str) -> str:
+    """Convert 'r,g,b' (0-255 each) to '#rrggbb'. Returns #808080 on junk."""
+    try:
+        r, g, b = (max(0, min(255, int(v))) for v in triplet.split(","))
+        return f"#{r:02x}{g:02x}{b:02x}"
+    except (ValueError, AttributeError):
+        return "#808080"
 
 
 def _calshow_url(iso_start: str) -> str:
@@ -180,9 +202,9 @@ def fetch_calendar(days: int) -> list[CalEvent]:
     out: list[CalEvent] = []
     for line in res.stdout.splitlines():
         parts = line.split("|")
-        if len(parts) < 7:
+        if len(parts) < 8:
             continue
-        title, start, end, ad, cal, loc, notes = parts[:7]
+        title, start, end, ad, cal, loc, notes, color = parts[:8]
         out.append(CalEvent(
             title=title.strip(),
             start=start.strip(),
@@ -192,6 +214,7 @@ def fetch_calendar(days: int) -> list[CalEvent]:
             location=loc.strip(),
             notes=notes.strip()[:500],
             link=_calshow_url(start.strip()),
+            color=_rgb_to_hex(color.strip()),
         ))
     log.info("got %d calendar events", len(out))
     return out
@@ -259,7 +282,7 @@ def fetch_gmail(days: int) -> list[MailItem]:
                 date=iso,
                 message_id=mid,
                 snippet=" ".join(text.split())[:1000],
-                link_mail_app=f"message://%3C{urllib.parse.quote(mid)}%3E" if mid else "",
+                link_mail_app=f"message:%3C{urllib.parse.quote(mid)}%3E" if mid else "",
                 link_gmail_web=f"https://mail.google.com/mail/u/0/#search/rfc822msgid%3A{urllib.parse.quote(mid)}" if mid else "",
             ))
     log.info("got %d emails", len(out))
@@ -284,16 +307,23 @@ Tasks:
 3. Keep wording close to yesterday's digest where the facts are unchanged,
    so the user sees stable text day to day. Only change wording when facts
    change or an item is genuinely new.
-4. Each line must include its link in markdown-style format: <a href="...">title</a>.
-   For calendar items use the calshow: link provided.
-   For email items use the message:// link (Apple Mail) as primary and
-   the Gmail web link in parentheses as fallback.
-5. Be terse. Use short lines. Group by date with a date heading.
-6. If nothing new from email, say so explicitly in one line.
+4. Each calendar event line MUST start with a coloured marker using the
+   calendar's own colour (from the `color` field, a #rrggbb hex). Use
+   exactly this form: <span style="color:#RRGGBB">●</span>
+   Then the time, the event title wrapped in <a href="CALSHOW_LINK">…</a>,
+   and the calendar name in small italics at the end: <em>(Calendar name)</em>.
+5. Each email item line must link the subject. Use the Gmail web link as
+   the primary <a href="...">…</a>; append the Apple Mail link in small
+   parentheses as "(open in Mail)" — it only works if Gmail is configured
+   in Apple Mail, so it is a fallback not the default.
+6. Be terse. Short lines. Group by date with a date heading.
+7. If nothing new from email, say so explicitly in one line.
 
-Output format: HTML fragment (will be sent as an email body). Use simple
-tags: <h2>, <h3>, <ul>, <li>, <a href="...">, <strong>, <em>. No CSS, no
-inline styles, no <html>/<body> wrapper. No preamble or sign-off.
+Output format: HTML fragment (will be sent as an email body and also
+written to a local .html file). Use these tags: <h2>, <h3>, <ul>, <li>,
+<a href="...">, <strong>, <em>, <span style="color:#RRGGBB">. No other
+inline styles. No <html>/<body> wrapper (one is added around your output
+later). No preamble or sign-off.
 
 Do not invent events. If an email is ambiguous, flag it with "(verify)"."""
 
