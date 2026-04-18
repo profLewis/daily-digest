@@ -230,9 +230,19 @@ Every API-touching step writes one line to `~/Library/Logs/daily-digest.log` so 
 | `gmail: parsed M messages` | IMAP fetch complete |
 | `anthropic: calling MODEL (1 messages.create, max_tokens=4000)` | Claude API request outbound |
 | `anthropic: usage model=… input_tokens=… output_tokens=… cache_read=… cache_creation=…` | Claude API response, exact token counts |
+| `anthropic: estimated cost USD $0.NNNN (list price; actual bill in console)` | Estimated cost for this call, computed from published list prices |
 | `smtp: sending digest to … (N bytes)` | SMTP send opens |
 | `smtp: sent` | SMTP send complete |
 | `trashing digests from … before …` / `trashed N old digest(s)` | IMAP cleanup pass |
+| `run summary: calendar_events=… emails_scanned=… anthropic_in=… anthropic_out=… estimated_cost_usd=$… emailed=… exit=…` | End-of-run one-liner with totals; emitted whether the run succeeds or fails |
+
+The cost estimate uses published list prices baked into the script (`MODEL_PRICING_USD_PER_MTOKEN` in `daily_digest.py`). If you change models or Anthropic changes pricing, bump that table — the code will fall back to `estimated_cost_usd=unknown` rather than quote a stale number. These estimates are indicative only; the authoritative figure is in your [Anthropic Console usage page](https://console.anthropic.com/settings/usage).
+
+A week's worth of cost at a glance:
+
+```bash
+grep 'run summary' ~/Library/Logs/daily-digest.log | tail -7
+```
 
 To monitor live, `tail -f ~/Library/Logs/daily-digest.log`. To see a week's worth of token usage at a glance:
 

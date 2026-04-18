@@ -298,6 +298,50 @@ def fetch_gmail(days: int) -> list[MailItem]:
 # Claude: produce the digest
 # ---------------------------------------------------------------------------
 
+# USD per million tokens. List prices only — your actual bill may differ
+# depending on discounts, batch usage, or pricing changes. Check
+# https://www.anthropic.com/pricing for canonical numbers. Models not in
+# this table still run; cost is just reported as "unknown".
+MODEL_PRICING_USD_PER_MTOKEN = {
+    "claude-opus-4-7":   {"input": 15.0, "output": 75.0},
+    "claude-opus-4-6":   {"input": 15.0, "output": 75.0},
+    "claude-opus-4-5":   {"input": 15.0, "output": 75.0},
+    "claude-sonnet-4-6": {"input":  3.0, "output": 15.0},
+    "claude-sonnet-4-5": {"input":  3.0, "output": 15.0},
+    "claude-haiku-4-5":  {"input":  1.0, "output":  5.0},
+}
+
+
+def _price_for(model: str) -> dict | None:
+    """Find pricing for a model, matching exact id or a prefix (so dated
+    variants like claude-haiku-4-5-20251001 still resolve)."""
+    if model in MODEL_PRICING_USD_PER_MTOKEN:
+        return MODEL_PRICING_USD_PER_MTOKEN[model]
+    for k, v in MODEL_PRICING_USD_PER_MTOKEN.items():
+        if model.startswith(k):
+            return v
+    return None
+
+
+def _estimate_cost_usd(model: str, usage) -> float | None:
+    """Estimate USD cost from a messages.create usage object. Cache reads
+    are billed at 10% of input rate, cache writes at 125% — if the
+    library reports them we account for them separately."""
+    price = _price_for(model)
+    if not price:
+        return None
+    inp    = getattr(usage, "input_tokens", 0) or 0
+    out    = getattr(usage, "output_tokens", 0) or 0
+    c_read = getattr(usage, "cache_read_input_tokens", 0) or 0
+    c_wrt  = getattr(usage, "cache_creation_input_tokens", 0) or 0
+    return (
+        inp    * price["input"]           +
+        out    * price["output"]          +
+        c_read * price["input"] * 0.10    +
+        c_wrt  * price["input"] * 1.25
+    ) / 1_000_000
+
+
 SYSTEM_PROMPT = """You produce a crisp daily digest for the user's morning.
 
 Input: calendar events for the next N days, recent Gmail threads, and
@@ -335,7 +379,9 @@ Do not invent events. If an email is ambiguous, flag it with "(verify)"."""
 
 def build_digest(cal_events: list[CalEvent],
                  emails: list[MailItem],
-                 yesterday_html: str) -> str:
+                 yesterday_html: str) -> tuple[str, dict]:
+    """Return (html, stats). stats has input_tokens, output_tokens,
+    cache_read, cache_creation, and cost_usd (None if model unknown)."""
     client = anthropic.Anthropic(api_key=CFG["anthropic_key"])
 
     payload = {
@@ -362,22 +408,37 @@ def build_digest(cal_events: list[CalEvent],
     )
 
     usage = getattr(msg, "usage", None)
+    stats = {
+        "model": CFG["anthropic_model"],
+        "input_tokens": 0, "output_tokens": 0,
+        "cache_read": 0, "cache_creation": 0,
+        "cost_usd": None,
+    }
     if usage is not None:
+        stats["input_tokens"]   = getattr(usage, "input_tokens", 0) or 0
+        stats["output_tokens"]  = getattr(usage, "output_tokens", 0) or 0
+        stats["cache_read"]     = getattr(usage, "cache_read_input_tokens", 0) or 0
+        stats["cache_creation"] = getattr(usage, "cache_creation_input_tokens", 0) or 0
+        stats["cost_usd"]       = _estimate_cost_usd(CFG["anthropic_model"], usage)
         log.info(
             "anthropic: usage model=%s input_tokens=%d output_tokens=%d "
             "cache_read=%d cache_creation=%d",
-            CFG["anthropic_model"],
-            getattr(usage, "input_tokens", 0),
-            getattr(usage, "output_tokens", 0),
-            getattr(usage, "cache_read_input_tokens", 0) or 0,
-            getattr(usage, "cache_creation_input_tokens", 0) or 0,
+            stats["model"], stats["input_tokens"], stats["output_tokens"],
+            stats["cache_read"], stats["cache_creation"],
         )
+        if stats["cost_usd"] is not None:
+            log.info("anthropic: estimated cost USD $%.4f "
+                     "(list price; actual bill in console)", stats["cost_usd"])
+        else:
+            log.info("anthropic: cost estimate unavailable "
+                     "(model %s not in pricing table)", stats["model"])
     else:
         log.warning("anthropic: no usage returned on response")
 
-    return "".join(
+    html = "".join(
         block.text for block in msg.content if getattr(block, "type", "") == "text"
     ).strip()
+    return html, stats
 
 
 # ---------------------------------------------------------------------------
@@ -506,11 +567,18 @@ def main() -> int:
         log.error("another daily-digest instance is already running; exiting")
         return 4
 
+    rc = 0
+    stats: dict = {}
+    cal_n = mail_n = 0
+    emailed = False
+
     try:
         cal = fetch_calendar(CFG["calendar_days"])
+        cal_n = len(cal)
         mail = fetch_gmail(CFG["email_days"])
+        mail_n = len(mail)
         yesterday = load_yesterday()
-        html = build_digest(cal, mail, yesterday)
+        html, stats = build_digest(cal, mail, yesterday)
         if not html:
             log.error("empty digest from Claude, aborting")
             return 1
@@ -532,10 +600,24 @@ def main() -> int:
 
         save_today(html)
         send_email(html)
+        emailed = True
         return 0
     except Exception:
         log.exception("digest run failed")
-        return 2
+        rc = 2
+        return rc
+    finally:
+        cost = stats.get("cost_usd")
+        cost_str = f"${cost:.4f}" if isinstance(cost, (int, float)) else "unknown"
+        log.info(
+            "run summary: calendar_events=%d emails_scanned=%d "
+            "anthropic_in=%d anthropic_out=%d cache_read=%d cache_creation=%d "
+            "estimated_cost_usd=%s emailed=%s dry_run=%s exit=%d",
+            cal_n, mail_n,
+            stats.get("input_tokens", 0), stats.get("output_tokens", 0),
+            stats.get("cache_read", 0), stats.get("cache_creation", 0),
+            cost_str, emailed, args.dry_run, rc,
+        )
 
 
 if __name__ == "__main__":
