@@ -445,6 +445,32 @@ def build_digest(cal_events: list[CalEvent],
 # State + send
 # ---------------------------------------------------------------------------
 
+def _build_calendar_legend(cal_events: list[CalEvent]) -> str:
+    """Render a small legend box listing each calendar present in the
+    digest with its colour swatch — like a map key. Rendered in Python
+    rather than asked of Claude so the visual is deterministic."""
+    seen: dict[str, str] = {}
+    for e in cal_events:
+        if e.calendar and e.calendar not in seen:
+            seen[e.calendar] = e.color or "#808080"
+    if not seen:
+        return ""
+    items = "".join(
+        f'<li style="margin:2px 0;line-height:1.4">'
+        f'<span style="color:{colour};font-size:1.2em">●</span>&nbsp;{name}'
+        f'</li>'
+        for name, colour in sorted(seen.items(), key=lambda kv: kv[0].lower())
+    )
+    return (
+        '\n<div style="border:1px solid #ccc;border-radius:6px;'
+        'padding:10px 14px;margin-top:20px;font-size:0.9em;'
+        'background:#fafafa;display:inline-block">'
+        '<strong style="display:block;margin-bottom:6px">Calendars</strong>'
+        f'<ul style="list-style:none;padding:0;margin:0">{items}</ul>'
+        '</div>\n'
+    )
+
+
 def _wrap_html(fragment: str) -> str:
     """Wrap Claude's HTML fragment in a minimal document so browsers and
     mail clients render UTF-8 correctly. Without <meta charset> browsers
@@ -465,12 +491,13 @@ def load_yesterday() -> str:
     return f.read_text(encoding="utf-8") if f.exists() else ""
 
 
-def save_today(html: str) -> None:
-    # yesterday.html is a fragment so tomorrow's run can feed it straight
-    # back to Claude; the dated archive is wrapped for human browsing.
-    (CFG["state_dir"] / "yesterday.html").write_text(html, encoding="utf-8")
+def save_today(html_for_continuity: str, html_for_archive: str) -> None:
+    """yesterday.html stores Claude's raw fragment (fed back verbatim
+    tomorrow). The dated archive is a wrapped, human-friendly copy."""
+    (CFG["state_dir"] / "yesterday.html").write_text(
+        html_for_continuity, encoding="utf-8")
     (CFG["state_dir"] / f"digest-{dt.date.today().isoformat()}.html").write_text(
-        _wrap_html(html), encoding="utf-8")
+        _wrap_html(html_for_archive), encoding="utf-8")
 
 
 def trash_old_digests(keep_days: int) -> None:
@@ -583,9 +610,14 @@ def main() -> int:
             log.error("empty digest from Claude, aborting")
             return 1
 
+        # Append a colour legend (rendered in Python for determinism).
+        # yesterday.html keeps Claude's raw output only, so tomorrow's
+        # continuity context isn't polluted with the legend markup.
+        html_with_legend = html + _build_calendar_legend(cal)
+
         if args.dry_run:
             preview = CFG["state_dir"] / "preview.html"
-            preview.write_text(_wrap_html(html), encoding="utf-8")
+            preview.write_text(_wrap_html(html_with_legend), encoding="utf-8")
             log.info("dry run — preview at %s", preview)
             print(f"\nPreview written: {preview}")
             print(f"Open it:        open {preview}")
@@ -598,8 +630,8 @@ def main() -> int:
         except Exception:
             log.exception("digest cleanup failed (non-fatal, continuing)")
 
-        save_today(html)
-        send_email(html)
+        save_today(html, html_with_legend)
+        send_email(html_with_legend)
         emailed = True
         return 0
     except Exception:
