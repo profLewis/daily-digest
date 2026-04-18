@@ -1,5 +1,9 @@
 # daily-digest
 
+> ## 💳 Cost warning
+>
+> This tool makes **one Anthropic Claude API call per run** (normally one per day). Anthropic bills per token. The bill is small for most people — typically a few cents a day on Opus, a fraction of a cent on Sonnet — but **it is not zero**, and it scales with how many events and how much email you have. Set a spending cap in your [Anthropic Console](https://console.anthropic.com/settings/limits) before you leave the job running unattended. Every run writes `anthropic: usage model=… input_tokens=… output_tokens=…` to `~/Library/Logs/daily-digest.log` so you can see exactly what you're spending — see [Cost](#cost) below for details.
+
 > ## ⚠️ Security warning — read before you install
 >
 > This code integrates four sensitive things on your machine:
@@ -215,7 +219,28 @@ If it doesn't match your current Google app password, re-run `install.sh`.
 
 ## Cost
 
-One Claude API call per day. Inputs are typically 20–60k tokens (mostly email bodies); outputs are a few hundred. Pennies a day on Opus, fractions of a penny on Sonnet.
+One Claude API call per run (normally one per day). Inputs are typically 20–60k tokens (mostly email bodies); outputs are a few hundred. Pennies a day on Opus, fractions of a penny on Sonnet.
+
+Every API-touching step writes one line to `~/Library/Logs/daily-digest.log` so you can audit usage and spot runaway runs:
+
+| Log line | What it means |
+|---|---|
+| `gmail: IMAP login as you@… (last N days)` | IMAP connection opens |
+| `gmail: N messages since …, fetching last M` | IMAP SEARCH + FETCH count |
+| `gmail: parsed M messages` | IMAP fetch complete |
+| `anthropic: calling MODEL (1 messages.create, max_tokens=4000)` | Claude API request outbound |
+| `anthropic: usage model=… input_tokens=… output_tokens=… cache_read=… cache_creation=…` | Claude API response, exact token counts |
+| `smtp: sending digest to … (N bytes)` | SMTP send opens |
+| `smtp: sent` | SMTP send complete |
+| `trashing digests from … before …` / `trashed N old digest(s)` | IMAP cleanup pass |
+
+To monitor live, `tail -f ~/Library/Logs/daily-digest.log`. To see a week's worth of token usage at a glance:
+
+```bash
+grep 'anthropic: usage' ~/Library/Logs/daily-digest.log | tail -7
+```
+
+Cap spending at the source: set a monthly limit in the [Anthropic Console](https://console.anthropic.com/settings/limits).
 
 ## License
 

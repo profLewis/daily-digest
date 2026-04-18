@@ -251,7 +251,7 @@ def _extract_text(msg: email.message.Message) -> str:
 
 
 def fetch_gmail(days: int) -> list[MailItem]:
-    log.info("reading gmail (last %d days)", days)
+    log.info("gmail: IMAP login as %s (last %d days)", CFG["gmail_address"], days)
     since = (dt.date.today() - dt.timedelta(days=days)).strftime("%d-%b-%Y")
 
     out: list[MailItem] = []
@@ -264,7 +264,10 @@ def fetch_gmail(days: int) -> list[MailItem]:
         if typ != "OK":
             return []
         ids = data[0].split()
-        for msg_id in ids[-200:]:   # cap for safety
+        matched = ids[-200:]
+        log.info("gmail: %d messages since %s, fetching last %d",
+                 len(ids), since, len(matched))
+        for msg_id in matched:
             typ, raw = M.fetch(msg_id, "(RFC822)")
             if typ != "OK" or not raw or not raw[0]:
                 continue
@@ -287,7 +290,7 @@ def fetch_gmail(days: int) -> list[MailItem]:
                 link_mail_app=f"message:%3C{urllib.parse.quote(mid)}%3E" if mid else "",
                 link_gmail_web=f"https://mail.google.com/mail/u/0/#search/rfc822msgid%3A{urllib.parse.quote(mid)}" if mid else "",
             ))
-    log.info("got %d emails", len(out))
+    log.info("gmail: parsed %d messages", len(out))
     return out
 
 
@@ -343,6 +346,8 @@ def build_digest(cal_events: list[CalEvent],
         "yesterday_digest_html": yesterday_html,
     }
 
+    log.info("anthropic: calling %s (1 messages.create, max_tokens=4000)",
+             CFG["anthropic_model"])
     msg = client.messages.create(
         model=CFG["anthropic_model"],
         max_tokens=4000,
@@ -355,6 +360,21 @@ def build_digest(cal_events: list[CalEvent],
             ),
         }],
     )
+
+    usage = getattr(msg, "usage", None)
+    if usage is not None:
+        log.info(
+            "anthropic: usage model=%s input_tokens=%d output_tokens=%d "
+            "cache_read=%d cache_creation=%d",
+            CFG["anthropic_model"],
+            getattr(usage, "input_tokens", 0),
+            getattr(usage, "output_tokens", 0),
+            getattr(usage, "cache_read_input_tokens", 0) or 0,
+            getattr(usage, "cache_creation_input_tokens", 0) or 0,
+        )
+    else:
+        log.warning("anthropic: no usage returned on response")
+
     return "".join(
         block.text for block in msg.content if getattr(block, "type", "") == "text"
     ).strip()
@@ -446,10 +466,12 @@ def send_email(html_body: str) -> None:
     msg["From"] = CFG["gmail_address"]
     msg["To"] = CFG["recipient"]
 
+    log.info("smtp: sending digest to %s (%d bytes)",
+             CFG["recipient"], len(msg.as_bytes()))
     with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ssl.create_default_context()) as s:
         s.login(CFG["gmail_address"], CFG["gmail_app_pw"])
         s.send_message(msg)
-    log.info("sent digest to %s", CFG["recipient"])
+    log.info("smtp: sent")
 
 
 # ---------------------------------------------------------------------------
