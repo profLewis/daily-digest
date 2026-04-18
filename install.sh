@@ -138,7 +138,7 @@ security add-generic-password -U \
 ok "stored Gmail app password"
 
 security add-generic-password -U \
-    -s "daily-digest-anthropic" \
+    -a "api-key" -s "daily-digest-anthropic" \
     -T "" -w "$API_KEY" \
     -j "Anthropic API key used by daily-digest"
 ok "stored Anthropic API key"
