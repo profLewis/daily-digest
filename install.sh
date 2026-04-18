@@ -148,26 +148,103 @@ ok "stored Anthropic API key"
 # 5. Optional data sources
 # ---------------------------------------------------------------------------
 say "Optional data sources"
-
 echo ""
-echo "  ${B}Mail.app (optional)${N}"
-echo "  If you use Apple Mail with accounts beyond Gmail (iCloud, work,"
-echo "  Exchange, ...), we can read their inboxes too. Adds AppleScript"
-echo "  permission prompts on first run."
-read -r -p "  Also read Mail.app inboxes? [y/N] " yn_mail
-USE_MAIL_APP="false"
-[[ "$yn_mail" =~ ^[Yy] ]] && USE_MAIL_APP="true"
-
+echo "  Beyond Gmail, daily-digest can also draw from:"
+echo "    (a) every account Apple Mail is logged into"
+echo "    (b) your iMessage and SMS conversations"
+echo "  Both are OFF by default. You can change either answer later by"
+echo "  editing ${B}$CONFIG_FILE${N}, or re-running this installer."
 echo ""
-echo "  ${B}iMessage / SMS (optional, PRIVACY-SENSITIVE)${N}"
-echo "  Scans ~/Library/Messages/chat.db for recent messages and sends"
-echo "  their text to the Claude API as part of the digest input."
-echo "  This means your personal chat content leaves your machine."
-echo "  Requires Full Disk Access to whoever runs the script"
-echo "  (/bin/bash under launchd; your terminal if run manually)."
-read -r -p "  Also scan iMessage/SMS? [y/N] " yn_imsg
-USE_IMESSAGE="false"
-[[ "$yn_imsg" =~ ^[Yy] ]] && USE_IMESSAGE="true"
+
+# If re-running the installer, pick up the existing choice as the default
+# so users aren't forced to re-decide every time.
+prev_mail="false"; prev_imsg="false"
+if [[ -f "$CONFIG_FILE" ]]; then
+    prev_mail="$(awk -F'"' '/^DIGEST_USE_MAIL_APP=/{print $2}' "$CONFIG_FILE" 2>/dev/null)"
+    prev_imsg="$(awk -F'"' '/^DIGEST_USE_IMESSAGE=/{print $2}' "$CONFIG_FILE" 2>/dev/null)"
+    [[ -z "$prev_mail" ]] && prev_mail="false"
+    [[ -z "$prev_imsg" ]] && prev_imsg="false"
+fi
+_default_label() { [[ "$1" == "true" ]] && echo "Y/n" || echo "y/N"; }
+_parse_yn() {
+    # $1 = user input, $2 = previous value ('true'/'false')
+    local input="$1" prev="$2"
+    if [[ -z "$input" ]]; then
+        echo "$prev"
+    elif [[ "$input" =~ ^[Yy] ]]; then
+        echo "true"
+    else
+        echo "false"
+    fi
+}
+
+# --- (a) Mail.app ---------------------------------------------------------
+echo "  ${B}(a) Mail.app — other email accounts${N}  (current: $prev_mail)"
+cat <<'EOF'
+      What it does:
+        - Reads the Inbox of every account Mail.app is logged into
+          (iCloud, work Exchange, any extra IMAP/POP account).
+        - Merges those messages with your Gmail IMAP fetch; duplicates
+          (same Message-ID in both) are removed so Claude sees each
+          email once.
+        - Apple Mail holds the credentials; no per-account passwords
+          are needed here.
+      What it sends to Claude:
+        - Subject, sender, date, Message-ID, first ~1000 chars of body
+          for each recent inbox message across all accounts.
+      Permission needed:
+        - "Mail" under System Settings → Privacy & Security → Automation
+          (macOS asks on first run; click Allow).
+      Performance:
+        - Adds ~30–120s per run depending on mailbox sizes. If you have
+          huge inboxes, consider lowering DIGEST_EMAIL_DAYS.
+      Turn off later:
+        - Edit config.env → set DIGEST_USE_MAIL_APP="false".
+EOF
+read -r -p "      Enable Mail.app reading? [$(_default_label "$prev_mail")] " yn_mail
+USE_MAIL_APP="$(_parse_yn "$yn_mail" "$prev_mail")"
+echo "      ${G}→${N} DIGEST_USE_MAIL_APP=$USE_MAIL_APP"
+echo ""
+
+# --- (b) iMessage / SMS ---------------------------------------------------
+echo "  ${B}(b) iMessage / SMS — PRIVACY-SENSITIVE${N}  (current: $prev_imsg)"
+cat <<'EOF'
+      What it does:
+        - Reads ~/Library/Messages/chat.db (the same SQLite database
+          Messages.app uses) in read-only mode. Nothing is written.
+        - Pulls the text of every message sent/received in the last
+          DIGEST_IMESSAGE_DAYS days (default: 3).
+        - Passes those messages to Claude so event-like content
+          (appointments, RSVPs, flights, deliveries) that arrived by
+          message but isn't on your calendar still gets surfaced.
+      What it sends to Claude:
+        - Sender (phone/email handle), date, and message text for every
+          recent message — including things you might consider private.
+        - This leaves your machine and goes to the Anthropic API over
+          HTTPS. Anthropic's retention terms apply.
+      Permission needed:
+        - Full Disk Access for whoever runs the script:
+            • /bin/bash — required for the scheduled 02:00 run
+            • Your terminal (Terminal.app, iTerm2, ...) — if you run
+              the script manually and want chat.db to be readable
+          System Settings → Privacy & Security → Full Disk Access → "+"
+      Scope controls:
+        - DIGEST_IMESSAGE_DAYS (default 3) sets how far back to read.
+      Try before you commit:
+        - You can say No here and still test it as a one-off with:
+            DIGEST_USE_IMESSAGE=true ~/daily-digest/run.sh --dry-run
+          The preview lands at ~/.local/share/daily-digest/preview.html
+      Turn off later:
+        - Edit config.env → set DIGEST_USE_IMESSAGE="false".
+EOF
+read -r -p "      Enable iMessage/SMS scanning? [$(_default_label "$prev_imsg")] " yn_imsg
+USE_IMESSAGE="$(_parse_yn "$yn_imsg" "$prev_imsg")"
+echo "      ${G}→${N} DIGEST_USE_IMESSAGE=$USE_IMESSAGE"
+if [[ "$USE_IMESSAGE" == "true" ]]; then
+    warn "iMessage scanning is enabled. Personal chat content will be sent"
+    warn "to the Anthropic API. You can disable it any time by editing"
+    warn "$CONFIG_FILE."
+fi
 echo ""
 
 
