@@ -85,9 +85,22 @@ Edit `~/.config/daily-digest/config.env`:
 | `DIGEST_RECIPIENT` | same as above | Where the digest is emailed |
 | `DIGEST_CAL_DAYS` | `14` | Days of calendar to include |
 | `DIGEST_EMAIL_DAYS` | `3` | Days of Gmail to scan |
+| `DIGEST_KEEP_DAYS` | `1` | Days of past digests to keep in your inbox — see below |
 | `ANTHROPIC_MODEL` | `claude-opus-4-7` | Model. `claude-sonnet-4-6` is cheaper and fast enough. |
 
 Changes take effect on the next run — no reinstall.
+
+### Auto-deleting old digests
+
+Each run begins by moving *its own* prior digest emails to Gmail Trash, so the inbox doesn't fill up. Matching is strict: messages only get trashed if they're **from your own address** AND have a subject starting with `Daily digest —`. Nothing else is touched. Gmail empties Trash automatically after 30 days, so old digests are recoverable for a month.
+
+- `DIGEST_KEEP_DAYS=1` (default) — keep only today's digest
+- `DIGEST_KEEP_DAYS=7` — keep a week's worth
+- `DIGEST_KEEP_DAYS=0` (or any non-positive value) — disable cleanup
+
+### Don't run multiple instances
+
+Gmail's IMAP server allows roughly 15 concurrent connections per account, and overlapping runs can also corrupt `yesterday.html`. The script takes an `fcntl` file lock on `~/.local/share/daily-digest/daily-digest.lock` at startup and exits immediately with code `4` if another copy is already running. So `launchctl start com.user.dailydigest` while a dry-run is still in progress is safe — the second invocation just quits. If you see `[ALERT] Too many simultaneous connections. (Failure)` during install, wait a minute for Gmail to time out the stale connections and try again.
 
 ## Waking the Mac at 02:00
 

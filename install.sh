@@ -168,6 +168,11 @@ DIGEST_CAL_DAYS="14"
 # How many days of email to scan:
 DIGEST_EMAIL_DAYS="3"
 
+# How many days of past digests to keep in Gmail. Each run trashes older
+# copies (moves to [Gmail]/Trash, which Google purges after 30 days).
+# 1 = keep only today's digest (recommended). Set to 0 or negative to disable.
+DIGEST_KEEP_DAYS="1"
+
 # Claude model. 'claude-opus-4-7' is most capable; 'claude-sonnet-4-6' is
 # cheaper and fast enough.
 ANTHROPIC_MODEL="claude-opus-4-7"

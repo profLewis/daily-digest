@@ -19,6 +19,7 @@ import datetime as dt
 import email
 import email.header
 import email.utils
+import fcntl
 import imaplib
 import json
 import logging
@@ -60,6 +61,7 @@ CFG = {
     "anthropic_model":   os.environ.get("ANTHROPIC_MODEL", "claude-opus-4-7"),
     "calendar_days":     int(os.environ.get("DIGEST_CAL_DAYS", "14")),
     "email_days":        int(os.environ.get("DIGEST_EMAIL_DAYS", "3")),
+    "keep_days":         int(os.environ.get("DIGEST_KEEP_DAYS", "1")),
     "state_dir":         Path(os.environ.get(
                             "DIGEST_STATE_DIR",
                             Path.home() / ".local" / "share" / "daily-digest")),
@@ -390,6 +392,53 @@ def save_today(html: str) -> None:
         _wrap_html(html), encoding="utf-8")
 
 
+def trash_old_digests(keep_days: int) -> None:
+    """Move prior daily-digest emails (sent by us to ourselves) older than
+    `keep_days` days from today into Gmail Trash. keep_days=1 means keep
+    only today's; keep_days<1 disables cleanup entirely.
+
+    Only touches messages whose Subject matches our fixed pattern AND whose
+    From is our own address — nothing else in the mailbox is at risk.
+    Gmail empties Trash automatically after 30 days."""
+    if keep_days < 1:
+        log.info("digest cleanup disabled (DIGEST_KEEP_DAYS=%d)", keep_days)
+        return
+
+    cutoff = dt.date.today() - dt.timedelta(days=keep_days - 1)
+    before = cutoff.strftime("%d-%b-%Y")
+    addr = CFG["gmail_address"]
+
+    log.info("trashing digests from %s before %s", addr, before)
+    with imaplib.IMAP4_SSL("imap.gmail.com", 993) as M:
+        M.login(addr, CFG["gmail_app_pw"])
+        # All Mail is writable and contains sent items as well as received,
+        # so we find our own outgoing digests there.
+        M.select('"[Gmail]/All Mail"')
+        typ, data = M.uid(
+            "SEARCH", None,
+            "FROM", f'"{addr}"',
+            "SUBJECT", '"Daily digest"',
+            "BEFORE", f'"{before}"',
+        )
+        if typ != "OK" or not data or not data[0]:
+            log.info("no old digests to trash")
+            return
+        uids = data[0].split()
+        if not uids:
+            log.info("no old digests to trash")
+            return
+
+        uid_str = b",".join(uids).decode()
+        try:
+            M.uid("MOVE", uid_str, '"[Gmail]/Trash"')
+        except imaplib.IMAP4.error as e:
+            log.warning("IMAP MOVE failed (%s); falling back to COPY+DELETE", e)
+            M.uid("COPY", uid_str, '"[Gmail]/Trash"')
+            M.uid("STORE", uid_str, "+FLAGS", "\\Deleted")
+            M.expunge()
+        log.info("trashed %d old digest(s)", len(uids))
+
+
 def send_email(html_body: str) -> None:
     today = dt.date.today().strftime("%A %-d %B %Y")
     msg = MIMEText(_wrap_html(html_body), "html", "utf-8")
@@ -407,11 +456,33 @@ def send_email(html_body: str) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
+def _acquire_single_instance_lock():
+    """Stop two copies of daily-digest running at once. Gmail throttles to
+    ~15 concurrent IMAP connections per account, and overlapping runs can
+    also corrupt yesterday.html. Returns the held file handle — keep it
+    alive for the duration of the run; Python closing it releases the lock.
+    Returns None if another instance is already running."""
+    lockfile = CFG["state_dir"] / "daily-digest.lock"
+    try:
+        lf = open(lockfile, "w")
+        fcntl.flock(lf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return None
+    lf.write(f"{os.getpid()}\n")
+    lf.flush()
+    return lf
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[1])
     ap.add_argument("--dry-run", action="store_true",
                     help="build the digest and save it, but don't send email")
     args = ap.parse_args()
+
+    lock = _acquire_single_instance_lock()
+    if lock is None:
+        log.error("another daily-digest instance is already running; exiting")
+        return 4
 
     try:
         cal = fetch_calendar(CFG["calendar_days"])
@@ -429,6 +500,13 @@ def main() -> int:
             print(f"\nPreview written: {preview}")
             print(f"Open it:        open {preview}")
             return 0
+
+        # Clean up old digests before sending today's, so tomorrow's
+        # search window won't include today's freshly-sent copy.
+        try:
+            trash_old_digests(CFG["keep_days"])
+        except Exception:
+            log.exception("digest cleanup failed (non-fatal, continuing)")
 
         save_today(html)
         send_email(html)
