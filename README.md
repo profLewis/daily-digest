@@ -1,5 +1,18 @@
 # daily-digest
 
+> # 🛑 STOP — READ THIS FIRST
+>
+> **This is an exploratory / educational project.** Its purpose is to explore how to wire together the Claude API, Gmail (IMAP + SMTP), the macOS Calendar, Apple Mail, and iMessage into a single daily briefing. It is **not** a polished product, it has **not** been security-audited by anyone other than its author, and it **will change without notice**.
+>
+> Before you run a single line of it:
+>
+> 1. **Verify the source.** Only run copies cloned directly from `https://github.com/profLewis/daily-digest`. A fork or a downloaded zip from anywhere else may contain modifications you haven't inspected. Check `git remote -v` after cloning.
+> 2. **Read the code.** It is small on purpose — about 600 lines of Python and three short shell scripts. Read `daily_digest.py`, `install.sh`, `run.sh`, and `uninstall.sh` end-to-end before running `install.sh`.
+> 3. **Read the [Privacy statement](#privacy-what-leaves-your-machine) carefully.** This tool sends your email content, calendar events, and (if you opt in) iMessage conversations to the Anthropic Claude API. That data leaves your machine. If that isn't acceptable to you, don't use this.
+> 4. **Know how to remove it.** See [Uninstall](#uninstall) below — it is a single command.
+>
+> If any of steps 1–4 feels like too much, **don't install this**. Use a hosted calendar digest service instead.
+
 > ## 💳 Cost warning
 >
 > This tool makes **one Anthropic Claude API call per run** (normally one per day). Anthropic bills per token. The bill is small for most people — typically a few cents a day on Opus, a fraction of a cent on Sonnet — but **it is not zero**, and it scales with how many events and how much email you have. Set a spending cap in your [Anthropic Console](https://console.anthropic.com/settings/limits) before you leave the job running unattended. Every run writes `anthropic: usage model=… input_tokens=… output_tokens=…` to `~/Library/Logs/daily-digest.log` so you can see exactly what you're spending — see [Cost](#cost) below for details.
@@ -27,6 +40,61 @@
 A macOS background job that emails you a tidy HTML summary of your day each morning.
 
 Every night at 02:00 it wakes up, reads your Calendar and the last few days of Gmail, asks Claude to turn them into a clean digest, and sends the result to your inbox. Events that appear in email but aren't yet on your calendar are surfaced separately so nothing slips through.
+
+**Need to get rid of it right now?** Run `~/daily-digest/uninstall.sh` (or `./uninstall.sh --purge` to also wipe archived digests). Full details in the [Uninstall](#uninstall) section.
+
+## Privacy — what leaves your machine
+
+> ⚠️ **This is the single most important section. Read it in full before deciding to use the tool.** If you're not comfortable with anything here, don't install.
+
+Every run opens exactly three outbound network connections:
+
+- **`imap.gmail.com:993` and `smtp.gmail.com:465`** — Google. Reading and sending your own Gmail. Google already has this data.
+- **`api.anthropic.com:443`** — Anthropic's Claude API. **Your message contents, calendar events, and (if enabled) iMessage conversations are sent here as part of every request.**
+
+Nothing else leaves the machine. No telemetry, no analytics, no third-party services.
+
+### What gets sent to Anthropic
+
+Every run sends one `messages.create` request containing a JSON payload Claude can read. That payload includes:
+
+| Data | Source | What's included |
+|---|---|---|
+| Calendar events | macOS Calendar (all attached accounts) | Title, start/end, calendar name, location, up to 500 chars of notes |
+| Gmail messages | `[Gmail]/All Mail`, last 3 days by default | Subject, sender, date, Message-ID, first ~1000 chars of body |
+| Mail.app messages *(if `DIGEST_USE_MAIL_APP=true`)* | Every account Mail.app is logged into | As above, per account |
+| iMessage/SMS *(if `DIGEST_USE_IMESSAGE=true`)* | `~/Library/Messages/chat.db`, last 3 days | Sender handle (phone/email), date, up to 1000 chars of message text |
+| Yesterday's digest | Local file | Full HTML from yesterday's run (contains event titles + email subjects) |
+
+Claude's HTML response comes back and gets emailed to you and saved locally.
+
+### What Anthropic does with that data
+
+Per Anthropic's published policy (as at the time of writing — **verify yourself at the links below**, not from this README):
+
+1. **Not used to train models.** For API traffic, Anthropic's commercial terms state inputs and outputs are not used to train their models. This is different from the consumer `claude.ai` product, which has different defaults.
+2. **Retained up to 30 days** for abuse monitoring and Trust & Safety review, then deleted. Enterprise customers may negotiate zero-retention agreements; standard API access has this retention.
+3. **May be reviewed by humans if flagged** by automated moderation classifiers. For a calendar/email digest this is unlikely to trigger but it is how the policy works.
+4. **Runs on AWS/GCP infrastructure.** Your API traffic transits those providers' networks (TLS in transit).
+5. **Metadata visible to you** in the Anthropic Console — token counts per call, but not content.
+
+**Authoritative sources** — read these before trusting the summary above:
+
+- [https://www.anthropic.com/legal/privacy](https://www.anthropic.com/legal/privacy)
+- [https://www.anthropic.com/legal/commercial-terms](https://www.anthropic.com/legal/commercial-terms)
+- [https://privacy.anthropic.com/](https://privacy.anthropic.com/) — data handling, sub-processors
+- [https://trust.anthropic.com/](https://trust.anthropic.com/)
+
+### Consent considerations
+
+If you enable iMessage scanning, you are sending the text of conversations from other people — **who have not consented to have their words sent to an AI provider** — to Anthropic. That's a judgement call you should make deliberately. Same applies to email senders and Mail.app inbox content, but message conversations are generally held to a higher privacy bar than email.
+
+### Kill switches
+
+- **Stop the daily run:** `launchctl unload ~/Library/LaunchAgents/com.user.dailydigest.plist`
+- **Disable iMessage scanning:** edit `~/.config/daily-digest/config.env`, set `DIGEST_USE_IMESSAGE="false"`
+- **Disable Mail.app reading:** same file, set `DIGEST_USE_MAIL_APP="false"`
+- **Full removal:** `~/daily-digest/uninstall.sh --purge` — see [Uninstall](#uninstall)
 
 ## What it does, step by step
 
@@ -248,13 +316,57 @@ If the output looks longer or stranger than you'd expect, stop and investigate.
 
 ## Uninstall
 
+**Quick removal** — stops the scheduled run, deletes config, and removes Keychain secrets:
+
 ```bash
-cd ~/daily-digest
-./uninstall.sh           # remove agent, config, Keychain items
-./uninstall.sh --purge   # also delete state (archived digests, yesterday.html)
+~/daily-digest/uninstall.sh
 ```
 
-The repo files themselves are left alone; delete the directory manually if you want it gone.
+**Full removal** — also wipes archived digests and `yesterday.html`:
+
+```bash
+~/daily-digest/uninstall.sh --purge
+```
+
+**Then delete the repo itself** (the uninstaller doesn't touch it, in case you want to reinstall):
+
+```bash
+rm -rf ~/daily-digest
+```
+
+### What exactly gets removed
+
+The uninstaller cleans up:
+
+| Target | Removed? | Notes |
+|---|---|---|
+| `~/Library/LaunchAgents/com.user.dailydigest.plist` | ✅ always | Stops the 02:00 run |
+| Any running `daily_digest.py` process | ✅ always | `pkill`'d so nothing is mid-write when we remove state |
+| `~/.config/daily-digest/` | ✅ always | Config file |
+| `daily-digest.lock` in state dir | ✅ always | Instance lockfile |
+| Keychain item `daily-digest-gmail` | ✅ always | Your Gmail app password |
+| Keychain item `daily-digest-anthropic` | ✅ always | Your Anthropic API key |
+| `~/.local/share/daily-digest/` | Only with `--purge` | Archived digests, `yesterday.html`, `preview.html` |
+| `~/Library/Logs/daily-digest*.log` | Only with `--purge` | Main log + launchd stdout/stderr logs |
+| `~/daily-digest/` (the cloned repo) | ❌ never | `rm -rf ~/daily-digest` removes it |
+
+### What the uninstaller CANNOT remove for you — do these manually
+
+macOS and third parties own these; no script can touch them. The uninstaller prints this list at the end of its run too, so you won't miss it:
+
+- **macOS Automation permissions** → System Settings → Privacy & Security → Automation → remove any `Calendar` or `Mail` entries for `bash`, `osascript`, or your terminal.
+- **Full Disk Access** → System Settings → Privacy & Security → Full Disk Access → remove `/bin/bash` if you added it (needed for the 02:00 launchd run), and your terminal if you added it (needed to test iMessage reading manually).
+- **Scheduled wake** → if you ran `sudo pmset repeat wake …` per the README, reverse it with `sudo pmset repeat cancel`.
+- **Upstream credentials** — the Keychain copies are gone, but the originals still exist:
+    - Revoke the Gmail app password: [https://myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords)
+    - Revoke the Anthropic API key: [https://console.anthropic.com/settings/keys](https://console.anthropic.com/settings/keys)
+- **Python package** — the installer `pip install`'d `anthropic` (user site). Uninstall with `pip3 uninstall anthropic` if nothing else needs it.
+- **Delivered digest emails** — any that are still in your Gmail stay there. Use Gmail's search for `from:me subject:"Daily digest"` to find and delete them.
+
+### What the uninstaller does NOT touch (intentionally)
+
+- **Your mail, calendars, or messages.** The tool only ever reads them; uninstalling has nothing to reverse.
+- **Anthropic billing history.** Past API usage is immutable in your Anthropic Console.
 
 ## Troubleshooting
 
