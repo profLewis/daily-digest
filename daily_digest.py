@@ -332,19 +332,37 @@ def build_digest(cal_events: list[CalEvent],
 # State + send
 # ---------------------------------------------------------------------------
 
+def _wrap_html(fragment: str) -> str:
+    """Wrap Claude's HTML fragment in a minimal document so browsers and
+    mail clients render UTF-8 correctly. Without <meta charset> browsers
+    fall back to Latin-1 and em-dashes render as â€"."""
+    return (
+        '<!DOCTYPE html>\n'
+        '<html lang="en"><head>'
+        '<meta charset="utf-8">'
+        '<title>Daily digest</title>'
+        '</head><body>\n'
+        f'{fragment}\n'
+        '</body></html>\n'
+    )
+
+
 def load_yesterday() -> str:
     f = CFG["state_dir"] / "yesterday.html"
     return f.read_text(encoding="utf-8") if f.exists() else ""
 
 
 def save_today(html: str) -> None:
+    # yesterday.html is a fragment so tomorrow's run can feed it straight
+    # back to Claude; the dated archive is wrapped for human browsing.
     (CFG["state_dir"] / "yesterday.html").write_text(html, encoding="utf-8")
-    (CFG["state_dir"] / f"digest-{dt.date.today().isoformat()}.html").write_text(html, encoding="utf-8")
+    (CFG["state_dir"] / f"digest-{dt.date.today().isoformat()}.html").write_text(
+        _wrap_html(html), encoding="utf-8")
 
 
 def send_email(html_body: str) -> None:
     today = dt.date.today().strftime("%A %-d %B %Y")
-    msg = MIMEText(html_body, "html", "utf-8")
+    msg = MIMEText(_wrap_html(html_body), "html", "utf-8")
     msg["Subject"] = f"Daily digest — {today}"
     msg["From"] = CFG["gmail_address"]
     msg["To"] = CFG["recipient"]
@@ -376,7 +394,7 @@ def main() -> int:
 
         if args.dry_run:
             preview = CFG["state_dir"] / "preview.html"
-            preview.write_text(html, encoding="utf-8")
+            preview.write_text(_wrap_html(html), encoding="utf-8")
             log.info("dry run — preview at %s", preview)
             print(f"\nPreview written: {preview}")
             print(f"Open it:        open {preview}")
