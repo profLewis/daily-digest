@@ -24,6 +24,7 @@ import imaplib
 import json
 import logging
 import os
+import platform
 import smtplib
 import ssl
 import subprocess
@@ -686,6 +687,27 @@ def _build_calendar_legend(cal_events: list[CalEvent]) -> str:
     )
 
 
+REPO_URL = "https://github.com/profLewis/daily-digest"
+
+
+def _build_footer() -> str:
+    """Provenance footer: which machine, which user, which repo. Lets the
+    recipient verify the source and distinguish digests from multiple
+    machines if they run it on more than one."""
+    host = platform.node() or "unknown-host"
+    user = os.environ.get("USER") or os.environ.get("LOGNAME") or "?"
+    now  = dt.datetime.now().strftime("%Y-%m-%d %H:%M %Z").strip()
+    return (
+        '\n<hr style="border:none;border-top:1px solid #eee;margin-top:18px">\n'
+        '<div style="font-size:0.8em;color:#888;margin-top:8px;line-height:1.4">'
+        f'Generated {now} on <strong>{host}</strong> '
+        f'(user <code>{user}</code>) by '
+        f'<a href="{REPO_URL}" style="color:#888">daily-digest</a>. '
+        'Review the code before trusting anything it says.'
+        '</div>\n'
+    )
+
+
 def _wrap_html(fragment: str) -> str:
     """Wrap Claude's HTML fragment in a minimal document so browsers and
     mail clients render UTF-8 correctly. Without <meta charset> browsers
@@ -838,10 +860,11 @@ def main() -> int:
             log.error("empty digest from Claude, aborting")
             return 1
 
-        # Append a colour legend (rendered in Python for determinism).
-        # yesterday.html keeps Claude's raw output only, so tomorrow's
-        # continuity context isn't polluted with the legend markup.
-        html_with_legend = html + _build_calendar_legend(cal)
+        # Append a colour legend and provenance footer (rendered in
+        # Python for determinism). yesterday.html keeps Claude's raw
+        # output only, so tomorrow's continuity context isn't polluted
+        # with the legend and footer markup.
+        html_with_legend = html + _build_calendar_legend(cal) + _build_footer()
 
         if args.dry_run:
             preview = CFG["state_dir"] / "preview.html"
