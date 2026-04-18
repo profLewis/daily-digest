@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Runtime state (lives outside the repo anyway, but just in case someone
+# sets DIGEST_STATE_DIR to the repo)
+*.html
+*.log
+preview.html
+yesterday.html
+digest-*.html
+
+# Rendered plist (the template is tracked; the rendered version is personal)
+com.user.dailydigest.plist
+
+# macOS noise
+.DS_Store
+
+# Editor files
+.idea/
+.vscode/
+*.swp
