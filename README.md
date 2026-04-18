@@ -32,6 +32,8 @@ Every night at 02:00 it wakes up, reads your Calendar and the last few days of G
 
 1. **Read the calendar.** An AppleScript pulls every event from the local macOS Calendar app for the next *N* days (default 14). Because it reads the unified store, iCloud, Google, Exchange, and subscribed calendars all come through in one pass — no per-provider OAuth.
 2. **Read recent Gmail.** Connects to `imap.gmail.com` over SSL using an app password, opens `[Gmail]/All Mail`, and fetches the last *M* days of messages (default 3). Captures subject, sender, date, a plain-text snippet, and the `Message-ID` so the digest can link back to each thread in Mail.app (`message://…`) or Gmail on the web.
+   - **Optional — Mail.app accounts (opt-in).** Set `DIGEST_USE_MAIL_APP=true` to also pull recent inbox messages from every account Mail.app is logged into (iCloud, work, Exchange, any IMAP account). See [Mail.app](#optional-mailapp-other-email-accounts).
+   - **Optional — iMessage/SMS (opt-in).** Set `DIGEST_USE_IMESSAGE=true` to scan recent iMessage and SMS conversations for event-like content. Privacy-sensitive — see the [iMessage opt-in](#optional-imessagesms-scanning) section below.
 3. **Feed yesterday's digest back in.** The previous morning's rendered HTML is stored on disk and passed to Claude as context. The system prompt tells Claude to keep wording close to yesterday's where the underlying facts haven't changed, so the digest reads as a stable daily document rather than a freshly-paraphrased one each morning.
 4. **Ask Claude to produce the digest.** One call to the Anthropic API. Claude groups events by day, then scans emails for event-like content (invitations, bookings, flights, deliveries, deadlines) and flags anything that isn't already on the calendar under "Possible events from email not yet in calendar". Ambiguous items get a `(verify)` tag rather than being invented.
 5. **Render and send.** The response is an HTML fragment with clickable links to each event (`calshow:` URLs open Calendar on that day; `message://` URLs open the thread in Mail). It goes out via Gmail SMTP (SSL, port 465) to whichever address you configured.
@@ -79,6 +81,15 @@ launchctl start com.user.dailydigest    # fire the scheduled job now
 
 A dry run writes `~/.local/share/daily-digest/preview.html`. Open it in a browser to see what would have been sent.
 
+**Try an optional source for one run only** (without changing config):
+
+```bash
+DIGEST_USE_IMESSAGE=true ~/daily-digest/run.sh --dry-run
+DIGEST_USE_MAIL_APP=true ~/daily-digest/run.sh --dry-run
+```
+
+That way you can see what iMessage or Mail.app content would appear in the digest before committing to having it in every run.
+
 ## Configuration
 
 Edit `~/.config/daily-digest/config.env`:
@@ -90,9 +101,53 @@ Edit `~/.config/daily-digest/config.env`:
 | `DIGEST_CAL_DAYS` | `14` | Days of calendar to include |
 | `DIGEST_EMAIL_DAYS` | `3` | Days of Gmail to scan |
 | `DIGEST_KEEP_DAYS` | `1` | Days of past digests to keep in your inbox — see below |
+| `DIGEST_USE_MAIL_APP` | `false` | Also scan Mail.app inboxes (all accounts Mail is logged into) |
+| `DIGEST_USE_IMESSAGE` | `false` | Also scan iMessage/SMS — see [iMessage opt-in](#optional-imessagesms-scanning) |
+| `DIGEST_IMESSAGE_DAYS` | `3` | How far back to scan iMessage/SMS |
 | `ANTHROPIC_MODEL` | `claude-opus-4-7` | Model. `claude-sonnet-4-6` is cheaper and fast enough. |
 
 Changes take effect on the next run — no reinstall.
+
+### Optional: Mail.app (other email accounts)
+
+By default the tool only reads Gmail over IMAP. If you use **Apple Mail** with additional accounts (iCloud, work Exchange, extra IMAP accounts), set `DIGEST_USE_MAIL_APP=true` and the script will also read the Inbox of every account Mail.app is logged into — no per-account credentials needed. First run triggers an "allow Automation" prompt for Mail. On large mailboxes this can add 30–120 seconds to each run.
+
+### Optional: iMessage/SMS scanning
+
+> ⚠️ **Privacy-sensitive.** Enabling this sends the text of your recent iMessage and SMS conversations to the Claude API as part of the digest input. Only do this if you're comfortable with that.
+
+Set `DIGEST_USE_IMESSAGE=true` to have the script read the last `DIGEST_IMESSAGE_DAYS` days (default 3) of messages from `~/Library/Messages/chat.db` — the same store Messages.app uses. Claude then surfaces anything that looks like a calendar item (appointments, bookings, RSVPs, flights) that isn't already on your calendar. Nothing is written back to Messages; the script is read-only against `chat.db`.
+
+Requirements:
+
+- **Full Disk Access** for `/bin/bash` (and for your terminal, if you want to test it manually). System Settings → Privacy & Security → Full Disk Access.
+- This is off by default — the installer asks you explicitly.
+
+**Enable for the scheduled 02:00 run (edit config):**
+
+```bash
+$EDITOR ~/.config/daily-digest/config.env
+# set DIGEST_USE_IMESSAGE="true", save
+```
+
+Config changes take effect on the next run — no reinstall needed. To verify the change is live:
+
+```bash
+grep DIGEST_USE_IMESSAGE ~/.config/daily-digest/config.env
+```
+
+**Try it for a single manual run, without changing the config:**
+
+```bash
+DIGEST_USE_IMESSAGE=true ~/daily-digest/run.sh --dry-run
+open ~/.local/share/daily-digest/preview.html
+```
+
+**Disable it later:**
+
+```bash
+$EDITOR ~/.config/daily-digest/config.env    # set DIGEST_USE_IMESSAGE="false"
+```
 
 ### Auto-deleting old digests
 

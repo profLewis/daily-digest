@@ -62,6 +62,9 @@ CFG = {
     "calendar_days":     int(os.environ.get("DIGEST_CAL_DAYS", "14")),
     "email_days":        int(os.environ.get("DIGEST_EMAIL_DAYS", "3")),
     "keep_days":         int(os.environ.get("DIGEST_KEEP_DAYS", "1")),
+    "use_mail_app":      os.environ.get("DIGEST_USE_MAIL_APP", "false").lower() == "true",
+    "use_imessage":      os.environ.get("DIGEST_USE_IMESSAGE", "false").lower() == "true",
+    "imessage_days":     int(os.environ.get("DIGEST_IMESSAGE_DAYS", "3")),
     "state_dir":         Path(os.environ.get(
                             "DIGEST_STATE_DIR",
                             Path.home() / ".local" / "share" / "daily-digest")),
@@ -106,6 +109,16 @@ class MailItem:
     snippet: str
     link_mail_app: str    # message:<id> — Apple Mail, if Gmail is set up there
     link_gmail_web: str   # https://mail.google.com/mail/u/0/#search/rfc822msgid:<id>
+    source: str = "gmail_imap"  # "gmail_imap" or "mail_app"
+
+@dataclass
+class ChatMessage:
+    """iMessage or SMS pulled from Messages.app local store."""
+    platform: str         # "imessage"
+    sender: str           # phone number, email, or "me"
+    date: str             # ISO 8601
+    text: str             # body, truncated
+    is_from_me: bool
 
 
 # ---------------------------------------------------------------------------
@@ -295,6 +308,201 @@ def fetch_gmail(days: int) -> list[MailItem]:
 
 
 # ---------------------------------------------------------------------------
+# Mail.app via AppleScript — reads every account Mail is logged into.
+# Gated by DIGEST_USE_MAIL_APP=true. Requires Automation permission for
+# Mail (granted by first-run dialog, or in System Settings → Privacy &
+# Security → Automation).
+# ---------------------------------------------------------------------------
+
+APPLESCRIPT_MAIL = r"""
+on run argv
+    set daysBack to (item 1 of argv) as integer
+    set sinceDate to (current date) - (daysBack * days)
+    set SEP to "|§|"
+    set output to ""
+    tell application "Mail"
+        repeat with a in (every account)
+            set acctName to name of a
+            try
+                set inboxes to (every mailbox of a whose name is "INBOX")
+                if (count of inboxes) is 0 then
+                    set inboxes to (every mailbox of a whose name is "Inbox")
+                end if
+                repeat with mb in inboxes
+                    try
+                        set msgs to (messages of mb whose date received ≥ sinceDate)
+                    on error
+                        set msgs to {}
+                    end try
+                    repeat with m in msgs
+                        try
+                            set subj to subject of m
+                        on error
+                            set subj to ""
+                        end try
+                        try
+                            set sndr to sender of m
+                        on error
+                            set sndr to ""
+                        end try
+                        try
+                            set dStr to (date received of m as «class isot» as string)
+                        on error
+                            set dStr to ""
+                        end try
+                        try
+                            set mid to message id of m
+                        on error
+                            set mid to ""
+                        end try
+                        try
+                            set snip to content of m
+                            if (count of characters of snip) > 1200 then
+                                set snip to text 1 thru 1200 of snip
+                            end if
+                        on error
+                            set snip to ""
+                        end try
+                        set subj to my clean(subj, SEP)
+                        set sndr to my clean(sndr, SEP)
+                        set snip to my clean(snip, SEP)
+                        set output to output & acctName & SEP & subj & SEP & sndr & SEP & dStr & SEP & mid & SEP & snip & linefeed
+                    end repeat
+                end repeat
+            end try
+        end repeat
+    end tell
+    return output
+end run
+
+on clean(s, sep)
+    set tids to AppleScript's text item delimiters
+    try
+        set AppleScript's text item delimiters to {return, linefeed, tab}
+        set parts to text items of s
+        set AppleScript's text item delimiters to " "
+        set s to parts as text
+        set AppleScript's text item delimiters to sep
+        set parts to text items of s
+        set AppleScript's text item delimiters to " "
+        set s to parts as text
+    end try
+    set AppleScript's text item delimiters to tids
+    return s
+end clean
+"""
+
+
+def fetch_mail_app(days: int) -> list[MailItem]:
+    log.info("mail.app: AppleScript read of inbox messages (last %d days)", days)
+    res = subprocess.run(
+        ["osascript", "-e", APPLESCRIPT_MAIL, str(days)],
+        capture_output=True, text=True, timeout=300,
+    )
+    if res.returncode != 0:
+        log.error("mail.app osascript failed: %s", res.stderr.strip())
+        return []
+    out: list[MailItem] = []
+    for line in res.stdout.splitlines():
+        parts = line.split("|§|")
+        if len(parts) < 6:
+            continue
+        _acct, subject, sender, date_iso, mid, snip = parts[:6]
+        mid = mid.strip().strip("<>")
+        out.append(MailItem(
+            subject=subject.strip(),
+            sender=sender.strip(),
+            date=date_iso.strip(),
+            message_id=mid,
+            snippet=" ".join(snip.split())[:1000],
+            link_mail_app=f"message:%3C{urllib.parse.quote(mid)}%3E" if mid else "",
+            link_gmail_web="",
+            source="mail_app",
+        ))
+    log.info("mail.app: parsed %d messages across all accounts", len(out))
+    return out
+
+
+def merge_mail(primary: list[MailItem],
+               secondary: list[MailItem]) -> list[MailItem]:
+    """Deduplicate by Message-ID, preferring `primary` (carries Gmail web
+    links). Messages without a Message-ID are all kept."""
+    seen_ids = {m.message_id for m in primary if m.message_id}
+    merged = list(primary)
+    for m in secondary:
+        if m.message_id and m.message_id in seen_ids:
+            continue
+        merged.append(m)
+        if m.message_id:
+            seen_ids.add(m.message_id)
+    return merged
+
+
+# ---------------------------------------------------------------------------
+# iMessage / SMS via ~/Library/Messages/chat.db
+# Gated by DIGEST_USE_IMESSAGE=true. Opt-in because it sends personal
+# chat content to Claude. Requires Full Disk Access for whoever runs
+# the script (/bin/bash under launchd; the terminal emulator when run
+# manually).
+# ---------------------------------------------------------------------------
+
+_APPLE_EPOCH = dt.datetime(2001, 1, 1, tzinfo=dt.timezone.utc)
+
+
+def fetch_imessages(days: int) -> list[ChatMessage]:
+    db = Path.home() / "Library" / "Messages" / "chat.db"
+    if not db.exists():
+        log.warning("imessage: %s not found, skipping", db)
+        return []
+
+    since_dt = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
+    since_ns = int((since_dt - _APPLE_EPOCH).total_seconds() * 1_000_000_000)
+
+    log.info("imessage: reading chat.db (last %d days)", days)
+    import sqlite3
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    except sqlite3.OperationalError as exc:
+        log.error("imessage: cannot open chat.db (%s). Ensure Full Disk "
+                  "Access is granted to whoever runs this script.", exc)
+        return []
+
+    out: list[ChatMessage] = []
+    try:
+        cur = con.cursor()
+        cur.execute(
+            """
+            SELECT handle.id, message.date, message.text, message.is_from_me
+              FROM message
+              LEFT JOIN handle ON message.handle_id = handle.ROWID
+             WHERE message.date >= ?
+               AND message.text IS NOT NULL
+               AND length(message.text) > 0
+             ORDER BY message.date ASC
+            """,
+            (since_ns,),
+        )
+        for handle_id, mdate, text, is_from_me in cur.fetchall():
+            try:
+                sent = _APPLE_EPOCH + dt.timedelta(seconds=mdate / 1_000_000_000)
+                iso = sent.isoformat()
+            except (TypeError, OverflowError, ValueError):
+                iso = ""
+            out.append(ChatMessage(
+                platform="imessage",
+                sender=(handle_id or "") if not is_from_me else "me",
+                date=iso,
+                text=(text or "")[:1000],
+                is_from_me=bool(is_from_me),
+            ))
+    finally:
+        con.close()
+
+    log.info("imessage: fetched %d messages", len(out))
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Claude: produce the digest
 # ---------------------------------------------------------------------------
 
@@ -344,15 +552,17 @@ def _estimate_cost_usd(model: str, usage) -> float | None:
 
 SYSTEM_PROMPT = """You produce a crisp daily digest for the user's morning.
 
-Input: calendar events for the next N days, recent Gmail threads, and
-yesterday's digest (may be empty).
+Input: calendar events for the next N days, recent emails, recent chat
+messages (iMessage/SMS, may be empty), and yesterday's digest.
 
 Tasks:
 1. List all upcoming calendar events grouped by day (today first).
-2. Scan emails for event-like content (invitations, bookings, appointments,
-   reservations, flights, deliveries, deadlines, RSVPs). For each one,
-   decide if it is already represented in the calendar list. If yes, skip.
-   If no, surface it under "Possible events from email not yet in calendar".
+2. Scan emails AND chat messages for event-like content (invitations,
+   bookings, appointments, reservations, flights, deliveries, deadlines,
+   RSVPs). For each one, decide if it is already represented in the
+   calendar list. If yes, skip. If no, surface it under "Possible events
+   from email/messages not yet in calendar". Note the source next to each
+   surfaced item (e.g. "(email from X)" or "(iMessage from Y)").
 3. Keep wording close to yesterday's digest where the facts are unchanged,
    so the user sees stable text day to day. Only change wording when facts
    change or an item is genuinely new.
@@ -362,11 +572,13 @@ Tasks:
    Then the time, the event title wrapped in <a href="CALSHOW_LINK">…</a>,
    and the calendar name in small italics at the end: <em>(Calendar name)</em>.
 5. Each email item line must link the subject. Use the Gmail web link as
-   the primary <a href="...">…</a>; append the Apple Mail link in small
-   parentheses as "(open in Mail)" — it only works if Gmail is configured
-   in Apple Mail, so it is a fallback not the default.
-6. Be terse. Short lines. Group by date with a date heading.
-7. If nothing new from email, say so explicitly in one line.
+   the primary <a href="...">…</a> when present; otherwise use the Apple
+   Mail `message:` link. Append the alternate in small parentheses as
+   "(open in Mail)" if both exist.
+6. Chat messages have no link. Just state the sender and the essence of
+   the message in one line.
+7. Be terse. Short lines. Group by date with a date heading.
+8. If nothing new from email/messages, say so explicitly in one line.
 
 Output format: HTML fragment (will be sent as an email body and also
 written to a local .html file). Use these tags: <h2>, <h3>, <ul>, <li>,
@@ -374,11 +586,13 @@ written to a local .html file). Use these tags: <h2>, <h3>, <ul>, <li>,
 inline styles. No <html>/<body> wrapper (one is added around your output
 later). No preamble or sign-off.
 
-Do not invent events. If an email is ambiguous, flag it with "(verify)"."""
+Do not invent events. If an email or message is ambiguous, flag it with
+"(verify)"."""
 
 
 def build_digest(cal_events: list[CalEvent],
                  emails: list[MailItem],
+                 messages: list[ChatMessage],
                  yesterday_html: str) -> tuple[str, dict]:
     """Return (html, stats). stats has input_tokens, output_tokens,
     cache_read, cache_creation, and cost_usd (None if model unknown)."""
@@ -389,6 +603,7 @@ def build_digest(cal_events: list[CalEvent],
         "calendar_window_days": CFG["calendar_days"],
         "calendar": [asdict(e) for e in cal_events],
         "emails":   [asdict(m) for m in emails],
+        "messages": [asdict(m) for m in messages],
         "yesterday_digest_html": yesterday_html,
     }
 
@@ -596,16 +811,29 @@ def main() -> int:
 
     rc = 0
     stats: dict = {}
-    cal_n = mail_n = 0
+    cal_n = mail_n = mail_app_n = imsg_n = 0
     emailed = False
 
     try:
         cal = fetch_calendar(CFG["calendar_days"])
         cal_n = len(cal)
-        mail = fetch_gmail(CFG["email_days"])
-        mail_n = len(mail)
+
+        gmail_items = fetch_gmail(CFG["email_days"])
+        mail_n = len(gmail_items)
+
+        mail_app_items: list[MailItem] = []
+        if CFG["use_mail_app"]:
+            mail_app_items = fetch_mail_app(CFG["email_days"])
+            mail_app_n = len(mail_app_items)
+        mail = merge_mail(gmail_items, mail_app_items)
+
+        messages: list[ChatMessage] = []
+        if CFG["use_imessage"]:
+            messages = fetch_imessages(CFG["imessage_days"])
+            imsg_n = len(messages)
+
         yesterday = load_yesterday()
-        html, stats = build_digest(cal, mail, yesterday)
+        html, stats = build_digest(cal, mail, messages, yesterday)
         if not html:
             log.error("empty digest from Claude, aborting")
             return 1
@@ -642,10 +870,11 @@ def main() -> int:
         cost = stats.get("cost_usd")
         cost_str = f"${cost:.4f}" if isinstance(cost, (int, float)) else "unknown"
         log.info(
-            "run summary: calendar_events=%d emails_scanned=%d "
-            "anthropic_in=%d anthropic_out=%d cache_read=%d cache_creation=%d "
-            "estimated_cost_usd=%s emailed=%s dry_run=%s exit=%d",
-            cal_n, mail_n,
+            "run summary: calendar_events=%d gmail_imap=%d mail_app=%d "
+            "imessages=%d anthropic_in=%d anthropic_out=%d "
+            "cache_read=%d cache_creation=%d estimated_cost_usd=%s "
+            "emailed=%s dry_run=%s exit=%d",
+            cal_n, mail_n, mail_app_n, imsg_n,
             stats.get("input_tokens", 0), stats.get("output_tokens", 0),
             stats.get("cache_read", 0), stats.get("cache_creation", 0),
             cost_str, emailed, args.dry_run, rc,

@@ -145,7 +145,34 @@ ok "stored Anthropic API key"
 
 
 # ---------------------------------------------------------------------------
-# 5. Write config
+# 5. Optional data sources
+# ---------------------------------------------------------------------------
+say "Optional data sources"
+
+echo ""
+echo "  ${B}Mail.app (optional)${N}"
+echo "  If you use Apple Mail with accounts beyond Gmail (iCloud, work,"
+echo "  Exchange, ...), we can read their inboxes too. Adds AppleScript"
+echo "  permission prompts on first run."
+read -r -p "  Also read Mail.app inboxes? [y/N] " yn_mail
+USE_MAIL_APP="false"
+[[ "$yn_mail" =~ ^[Yy] ]] && USE_MAIL_APP="true"
+
+echo ""
+echo "  ${B}iMessage / SMS (optional, PRIVACY-SENSITIVE)${N}"
+echo "  Scans ~/Library/Messages/chat.db for recent messages and sends"
+echo "  their text to the Claude API as part of the digest input."
+echo "  This means your personal chat content leaves your machine."
+echo "  Requires Full Disk Access to whoever runs the script"
+echo "  (/bin/bash under launchd; your terminal if run manually)."
+read -r -p "  Also scan iMessage/SMS? [y/N] " yn_imsg
+USE_IMESSAGE="false"
+[[ "$yn_imsg" =~ ^[Yy] ]] && USE_IMESSAGE="true"
+echo ""
+
+
+# ---------------------------------------------------------------------------
+# 6. Write config
 # ---------------------------------------------------------------------------
 say "Writing config to $CONFIG_FILE"
 
@@ -173,23 +200,33 @@ DIGEST_EMAIL_DAYS="3"
 # 1 = keep only today's digest (recommended). Set to 0 or negative to disable.
 DIGEST_KEEP_DAYS="1"
 
+# Also read Mail.app inboxes (covers any non-Gmail accounts added to
+# Apple Mail). Requires Automation permission for Mail on first run.
+DIGEST_USE_MAIL_APP="$USE_MAIL_APP"
+
+# PRIVACY-SENSITIVE: also scan iMessage/SMS for calendar-like items.
+# Reads ~/Library/Messages/chat.db; requires Full Disk Access. Sends
+# message text to Claude. Opt in deliberately.
+DIGEST_USE_IMESSAGE="$USE_IMESSAGE"
+DIGEST_IMESSAGE_DAYS="3"
+
 # Claude model. 'claude-opus-4-7' is most capable; 'claude-sonnet-4-6' is
 # cheaper and fast enough.
 ANTHROPIC_MODEL="claude-opus-4-7"
 EOF
 chmod 600 "$CONFIG_FILE"
-ok "config written"
+ok "config written (use_mail_app=$USE_MAIL_APP use_imessage=$USE_IMESSAGE)"
 
 
 # ---------------------------------------------------------------------------
-# 6. Make scripts executable
+# 7. Make scripts executable
 # ---------------------------------------------------------------------------
 chmod +x "$REPO_DIR/run.sh" "$REPO_DIR/daily_digest.py" "$REPO_DIR/uninstall.sh"
 ok "run.sh, daily_digest.py, uninstall.sh marked executable"
 
 
 # ---------------------------------------------------------------------------
-# 7. Install launchd plist
+# 8. Install launchd plist
 # ---------------------------------------------------------------------------
 say "Installing launchd agent"
 
@@ -212,7 +249,7 @@ ok "agent installed and loaded ($LAUNCHD_PLIST)"
 
 
 # ---------------------------------------------------------------------------
-# 8. First run to trigger permission prompts
+# 9. First run to trigger permission prompts
 # ---------------------------------------------------------------------------
 say "First run — expect macOS permission prompts"
 
@@ -238,7 +275,7 @@ fi
 
 
 # ---------------------------------------------------------------------------
-# 9. Remind about Full Disk Access
+# 10. Remind about Full Disk Access
 # ---------------------------------------------------------------------------
 cat <<EOF
 
