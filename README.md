@@ -1,5 +1,25 @@
 # daily-digest
 
+> ## ⚠️ Security warning — read before you install
+>
+> This code integrates four sensitive things on your machine:
+>
+> - **Anthropic Claude API** — outbound HTTPS, using your API key
+> - **Your Gmail account** — IMAP read and SMTP send, using a Gmail app password
+> - **Your local macOS Calendar** — every calendar attached to the Calendar app (iCloud, Google, Exchange, subscribed feeds)
+> - **Your macOS login Keychain** — where the Gmail and Anthropic secrets are stored
+>
+> It is designed to do *only* those things. But you are running code from a public repository on your own hardware, with credentials that can read your mail, send mail as you, and spend money on the Anthropic API.
+>
+> **Never run `install.sh` without reading the source first.** The repo is small on purpose — about 400 lines of Python plus three short shell scripts. Read them end-to-end and satisfy yourself that nothing in there:
+>
+> - exfiltrates data to any host other than `imap.gmail.com`, `smtp.gmail.com`, and `api.anthropic.com`
+> - writes anywhere outside `~/.config/daily-digest/`, `~/.local/share/daily-digest/`, `~/Library/Logs/`, and `~/Library/LaunchAgents/`
+> - invokes unexpected binaries (only `python3`, `osascript`, `security`, `launchctl`, `pip`, and `sed` should appear)
+> - does anything with secrets other than store them in the Keychain and read them back at run time
+>
+> No automated tool can prove arbitrary code is benign — that's an undecidable problem in the general case. Static analysis can only catch *known bad patterns*. See [Auditing the code](#auditing-the-code) below for what actually helps.
+
 A macOS background job that emails you a tidy HTML summary of your day each morning.
 
 Every night at 02:00 it wakes up, reads your Calendar and the last few days of Gmail, asks Claude to turn them into a clean digest, and sends the result to your inbox. Events that appear in email but aren't yet on your calendar are surfaced separately so nothing slips through.
@@ -116,6 +136,43 @@ Secrets live only in the login Keychain:
 daily-digest-gmail       # Gmail app password
 daily-digest-anthropic   # Anthropic API key
 ```
+
+## Auditing the code
+
+No library can *prove* this or any code only does what it claims — by Rice's theorem, that's undecidable. What automated tools **can** do is flag known bad patterns. Combine a few of them and you cover most of what matters for a small repo like this:
+
+| Tool | What it checks | Install |
+|---|---|---|
+| [`bandit`](https://bandit.readthedocs.io/) | Python security anti-patterns: `shell=True`, hardcoded passwords, insecure SSL, `eval`, etc. | `pipx install bandit` |
+| [`semgrep`](https://semgrep.dev/) | Configurable pattern matching; rich community rule-sets for secrets exfiltration, dodgy imports. | `pipx install semgrep` |
+| [`pip-audit`](https://pypi.org/project/pip-audit/) | Checks `requirements.txt` against the CVE database. | `pipx install pip-audit` |
+| [`shellcheck`](https://www.shellcheck.net/) | Common shell-script mistakes and injection risks. | `brew install shellcheck` |
+
+Run all four from the repo root:
+
+```bash
+bandit -r daily_digest.py
+semgrep --config=auto .
+pip-audit -r requirements.txt
+shellcheck install.sh run.sh uninstall.sh
+```
+
+### The irreducible manual check
+
+Tools won't catch a deliberately malicious but syntactically innocent line. Before you run `install.sh`, eyeball these specifically:
+
+1. **Every outbound network call.** In `daily_digest.py` they're easy to enumerate — look for `imaplib.IMAP4_SSL`, `smtplib.SMTP_SSL`, and `anthropic.Anthropic()`. Those are the only three network destinations. Confirm no `urllib`, `requests`, `socket`, or `http` imports have appeared.
+2. **Every `subprocess` call.** There is exactly one: `subprocess.run(["osascript", ...])` to read the calendar. It takes no user-controlled input and runs a hard-coded AppleScript. Confirm no `shell=True` anywhere.
+3. **Every write to disk.** All writes go through `CFG["state_dir"]` and `CFG["log_file"]`, both of which resolve to `~/.local/share/daily-digest/` and `~/Library/Logs/` respectively. Confirm no other `open(..., "w")` or `Path.write_text` exists.
+4. **The three shell scripts.** `install.sh` does Keychain writes, config writes, and a `launchctl load`. `run.sh` reads Keychain and execs Python. `uninstall.sh` reverses it. None should download anything from the internet.
+
+A one-liner that surfaces the network, subprocess, and filesystem surface area of the Python for a quick visual check:
+
+```bash
+grep -nE 'imaplib|smtplib|anthropic|subprocess|socket|urllib|requests|http\.|open\(|write_text|mkdir' daily_digest.py
+```
+
+If the output looks longer or stranger than you'd expect, stop and investigate.
 
 ## Uninstall
 
