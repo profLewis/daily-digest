@@ -26,6 +26,7 @@ import logging
 import os
 import platform
 import smtplib
+import html as html_mod
 import ssl
 import subprocess
 import sys
@@ -100,6 +101,7 @@ class CalEvent:
     notes: str
     link: str             # calshow: URL that opens Calendar on that day
     color: str            # calendar colour as #rrggbb
+    title_html: str = ""  # pre-rendered <a href=calshow:…>Title</a> for Claude
 
 @dataclass
 class MailItem:
@@ -108,9 +110,10 @@ class MailItem:
     date: str
     message_id: str
     snippet: str
-    link_mail_app: str    # message:<id> — Apple Mail, if Gmail is set up there
-    link_gmail_web: str   # https://mail.google.com/mail/u/0/#search/rfc822msgid:<id>
+    link_mail_app: str    # message:<id> — Apple Mail, if mailbox is set up there
+    link_gmail_web: str   # https://mail.google.com/mail/?authuser=…#search/rfc822msgid:…
     source: str = "gmail_imap"  # "gmail_imap" or "mail_app"
+    subject_html: str = ""      # pre-rendered <a href=…>Subject</a> for Claude
 
 @dataclass
 class ChatMessage:
@@ -206,6 +209,76 @@ def _calshow_url(iso_start: str) -> str:
     return f"calshow:{int((d - epoch).total_seconds())}"
 
 
+def _clean_message_id(raw: str | None) -> str:
+    """Strip whitespace, angle brackets, and surrounding quotes. Message-IDs
+    arrive inconsistently from AppleScript vs IMAP — normalise once."""
+    if not raw:
+        return ""
+    s = raw.strip().strip("<>").strip().strip('"').strip("'")
+    return s
+
+
+def _mailto_apple_link(mid: str) -> str:
+    """`message:<Message-ID>` with the angle brackets URL-encoded and the
+    id itself percent-encoded (safe=empty so '@' '+' '=' all get escaped).
+    Empty string if mid is blank."""
+    if not mid:
+        return ""
+    return f"message:%3C{urllib.parse.quote(mid, safe='')}%3E"
+
+
+def _gmail_web_link(mid: str, account: str) -> str:
+    """Open a specific Gmail message by Message-ID, regardless of which
+    Google account the browser's session currently considers `u/0`.
+    `authuser=<address>` forces the right account. Empty if mid is blank."""
+    if not mid:
+        return ""
+    encoded_mid = urllib.parse.quote(mid, safe="")
+    encoded_account = urllib.parse.quote(account, safe="")
+    return (
+        "https://mail.google.com/mail/"
+        f"?authuser={encoded_account}"
+        f"#search/rfc822msgid%3A{encoded_mid}"
+    )
+
+
+def _build_subject_html(item: "MailItem", gmail_address: str) -> str:
+    """Render the full anchor HTML for an email subject. For Gmail-IMAP
+    sources the primary link is the Gmail web URL (works in any browser
+    without Apple Mail); for Mail.app-sourced messages (or when we have
+    no Gmail web link) the primary is the message: URL. If we have both,
+    the alternate is appended as a small "(in Mail)" link."""
+    subject_text = item.subject or "(no subject)"
+    safe_subject = html_mod.escape(subject_text)
+
+    gmail_url = _gmail_web_link(item.message_id, gmail_address) if item.message_id else ""
+    apple_url = _mailto_apple_link(item.message_id)
+
+    # Prefer the Gmail web link when present (most robust); else Apple Mail.
+    if gmail_url:
+        primary = gmail_url
+        alt = apple_url if apple_url else ""
+    elif apple_url:
+        primary = apple_url
+        alt = ""
+    else:
+        return f"<em>{safe_subject}</em>"  # no link at all
+
+    out = f'<a href="{html_mod.escape(primary, quote=True)}">{safe_subject}</a>'
+    if alt:
+        out += (f' <a href="{html_mod.escape(alt, quote=True)}" '
+                f'style="font-size:0.85em;color:#777">(in Mail)</a>')
+    return out
+
+
+def _build_title_html(title: str, calshow: str) -> str:
+    """Render the anchor HTML for a calendar event title."""
+    safe = html_mod.escape(title or "(no title)")
+    if not calshow:
+        return f"<strong>{safe}</strong>"
+    return f'<a href="{html_mod.escape(calshow, quote=True)}">{safe}</a>'
+
+
 def fetch_calendar(days: int) -> list[CalEvent]:
     log.info("reading calendar (%d days ahead)", days)
     res = subprocess.run(
@@ -221,6 +294,7 @@ def fetch_calendar(days: int) -> list[CalEvent]:
         if len(parts) < 8:
             continue
         title, start, end, ad, cal, loc, notes, color = parts[:8]
+        calshow = _calshow_url(start.strip())
         out.append(CalEvent(
             title=title.strip(),
             start=start.strip(),
@@ -229,8 +303,9 @@ def fetch_calendar(days: int) -> list[CalEvent]:
             calendar=cal.strip(),
             location=loc.strip(),
             notes=notes.strip()[:500],
-            link=_calshow_url(start.strip()),
+            link=calshow,
             color=_rgb_to_hex(color.strip()),
+            title_html=_build_title_html(title.strip(), calshow),
         ))
     log.info("got %d calendar events", len(out))
     return out
@@ -293,17 +368,20 @@ def fetch_gmail(days: int) -> list[MailItem]:
                 iso = email.utils.parsedate_to_datetime(date_hdr).isoformat()
             except (TypeError, ValueError):
                 iso = ""
-            mid = (msg.get("Message-ID") or "").strip("<>")
+            mid = _clean_message_id(msg.get("Message-ID"))
             text = _extract_text(msg)[:1500]
-            out.append(MailItem(
+            item = MailItem(
                 subject=subject,
                 sender=sender,
                 date=iso,
                 message_id=mid,
                 snippet=" ".join(text.split())[:1000],
-                link_mail_app=f"message:%3C{urllib.parse.quote(mid)}%3E" if mid else "",
-                link_gmail_web=f"https://mail.google.com/mail/u/0/#search/rfc822msgid%3A{urllib.parse.quote(mid)}" if mid else "",
-            ))
+                link_mail_app=_mailto_apple_link(mid),
+                link_gmail_web=_gmail_web_link(mid, CFG["gmail_address"]),
+                source="gmail_imap",
+            )
+            item.subject_html = _build_subject_html(item, CFG["gmail_address"])
+            out.append(item)
     log.info("gmail: parsed %d messages", len(out))
     return out
 
@@ -409,17 +487,19 @@ def fetch_mail_app(days: int) -> list[MailItem]:
         if len(parts) < 6:
             continue
         _acct, subject, sender, date_iso, mid, snip = parts[:6]
-        mid = mid.strip().strip("<>")
-        out.append(MailItem(
+        mid = _clean_message_id(mid)
+        item = MailItem(
             subject=subject.strip(),
             sender=sender.strip(),
             date=date_iso.strip(),
             message_id=mid,
             snippet=" ".join(snip.split())[:1000],
-            link_mail_app=f"message:%3C{urllib.parse.quote(mid)}%3E" if mid else "",
+            link_mail_app=_mailto_apple_link(mid),
             link_gmail_web="",
             source="mail_app",
-        ))
+        )
+        item.subject_html = _build_subject_html(item, CFG["gmail_address"])
+        out.append(item)
     log.info("mail.app: parsed %d messages across all accounts", len(out))
     return out
 
@@ -570,12 +650,16 @@ Tasks:
 4. Each calendar event line MUST start with a coloured marker using the
    calendar's own colour (from the `color` field, a #rrggbb hex). Use
    exactly this form: <span style="color:#RRGGBB">●</span>
-   Then the time, the event title wrapped in <a href="CALSHOW_LINK">…</a>,
-   and the calendar name in small italics at the end: <em>(Calendar name)</em>.
-5. Each email item line must link the subject. Use the Gmail web link as
-   the primary <a href="...">…</a> when present; otherwise use the Apple
-   Mail `message:` link. Append the alternate in small parentheses as
-   "(open in Mail)" if both exist.
+   Then the time, then the pre-rendered `title_html` VERBATIM (it already
+   contains a correctly-formed <a href="calshow:…"> anchor), and the
+   calendar name in small italics at the end: <em>(Calendar name)</em>.
+5. Each email item line must use the item's pre-rendered `subject_html`
+   VERBATIM as the linked subject. It already contains a correctly-
+   formed anchor (Gmail web URL when available, Apple Mail URL otherwise,
+   with an optional "(in Mail)" alternate). Do NOT construct your own
+   <a href="…"> anchors for email items; do NOT modify the URLs inside
+   `subject_html`; do NOT shorten or paraphrase them. Just paste the
+   string as-is.
 6. Chat messages have no link. Just state the sender and the essence of
    the message in one line.
 7. Be terse. Short lines. Group by date with a date heading.
@@ -588,7 +672,9 @@ inline styles. No <html>/<body> wrapper (one is added around your output
 later). No preamble or sign-off.
 
 Do not invent events. If an email or message is ambiguous, flag it with
-"(verify)"."""
+"(verify)". URLs you see in `title_html` and `subject_html` have been
+constructed by a trusted upstream process; never alter them even if they
+look odd — Message-IDs legitimately contain characters like @ + = & % ."""
 
 
 def build_digest(cal_events: list[CalEvent],

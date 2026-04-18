@@ -388,7 +388,19 @@ _next_free_slot() {   # $1 = starting minute-of-day; prints first clash-free slo
     echo "$start"
 }
 
-# --- Ask for time, warn on clash, and offer a clash-free default ---
+# --- If the starting default clashes, shift it to the next free slot
+#     BEFORE showing it to the user. The user can still override. ---
+default_mins=$(( DEFAULT_HOUR * 60 + DEFAULT_MINUTE ))
+default_clash="$(_clash_labels "$default_mins")"
+if [[ -n "$default_clash" ]]; then
+    warn "default $(printf '%02d:%02d' "$DEFAULT_HOUR" "$DEFAULT_MINUTE") clashes with:"
+    printf '%s' "$default_clash"
+    shifted=$(_next_free_slot $(( (default_mins + 30) % 1440 )))
+    DEFAULT_HOUR=$(( shifted / 60 ))
+    DEFAULT_MINUTE=$(( shifted % 60 ))
+    ok "suggesting $(printf '%02d:%02d' "$DEFAULT_HOUR" "$DEFAULT_MINUTE") — press Enter to accept, or type another time"
+fi
+
 input_default=$(printf '%02d:%02d' "$DEFAULT_HOUR" "$DEFAULT_MINUTE")
 while true; do
     read -r -p "  What time should the digest run? [HH:MM, default $input_default] " t_input
