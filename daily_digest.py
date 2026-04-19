@@ -225,7 +225,12 @@ def _mailto_apple_link(mid: str) -> str:
 def _gmail_web_link(mid: str, account: str) -> str:
     """Open a specific Gmail message by Message-ID, regardless of which
     Google account the browser's session currently considers `u/0`.
-    `authuser=<address>` forces the right account. Empty if mid is blank."""
+    `authuser=<address>` forces the right account. Empty if mid is blank.
+
+    Note: the colon after `rfc822msgid` MUST be a literal `:`, not `%3A`.
+    Gmail's hash router (both desktop and the Gmail iOS app) does not
+    percent-decode the fragment before matching, so the encoded form
+    silently lands on the inbox instead of the message."""
     if not mid:
         return ""
     encoded_mid = urllib.parse.quote(mid, safe="")
@@ -233,8 +238,21 @@ def _gmail_web_link(mid: str, account: str) -> str:
     return (
         "https://mail.google.com/mail/"
         f"?authuser={encoded_account}"
-        f"#search/rfc822msgid%3A{encoded_mid}"
+        f"#search/rfc822msgid:{encoded_mid}"
     )
+
+
+def _gcal_day_url(iso_start: str) -> str:
+    """Google Calendar day-view URL for the date in `iso_start`. Works in
+    mobile Safari and is intercepted by the Google Calendar iOS app if
+    installed. Used as the primary calendar link because `calshow:` is
+    macOS-only and does nothing on iPhone/iPad/web. Returns "" if the
+    date can't be parsed."""
+    try:
+        d = dt.datetime.fromisoformat(iso_start.replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    return f"https://calendar.google.com/calendar/u/0/r/day/{d.year}/{d.month}/{d.day}"
 
 
 def _build_subject_html(item: "MailItem", gmail_address: str) -> str:
@@ -258,17 +276,30 @@ def _build_subject_html(item: "MailItem", gmail_address: str) -> str:
         return f"<em>{safe_subject}</em>"  # no link at all
     out = f'<a href="{html_mod.escape(primary, quote=True)}">{safe_subject}</a>'
     if alt:
+        # Labelled "Mac Mail" rather than just "Mail" so iPhone readers
+        # know not to tap — the message: scheme is macOS-only in practice.
         out += (f' <a href="{html_mod.escape(alt, quote=True)}" '
-                f'style="font-size:0.85em;color:#777">(in Mail)</a>')
+                f'style="font-size:0.85em;color:#777">(in Mac Mail)</a>')
     return out
 
 
-def _build_title_html(title: str, calshow: str) -> str:
-    """Render the anchor HTML for a calendar event title."""
+def _build_title_html(title: str, gcal_url: str, calshow: str) -> str:
+    """Render the anchor HTML for a calendar event title.
+
+    Primary link is the Google Calendar day view (universal: works on
+    iPhone, iPad, and any browser). The macOS-only `calshow:` URL is
+    appended as a small "(in Mac Cal)" alternate so desktop users still
+    get one-click access to the native Calendar app."""
     safe = html_mod.escape(title or "(no title)")
-    if not calshow:
-        return f"<strong>{safe}</strong>"
-    return f'<a href="{html_mod.escape(calshow, quote=True)}">{safe}</a>'
+    if gcal_url:
+        out = f'<a href="{html_mod.escape(gcal_url, quote=True)}">{safe}</a>'
+        if calshow:
+            out += (f' <a href="{html_mod.escape(calshow, quote=True)}" '
+                    f'style="font-size:0.85em;color:#777">(in Mac Cal)</a>')
+        return out
+    if calshow:
+        return f'<a href="{html_mod.escape(calshow, quote=True)}">{safe}</a>'
+    return f"<strong>{safe}</strong>"
 
 
 def fetch_calendar(days: int) -> list[CalEvent]:
@@ -287,6 +318,10 @@ def fetch_calendar(days: int) -> list[CalEvent]:
             continue
         title, start, end, ad, cal, loc, notes, color = parts[:8]
         calshow = _calshow_url(start.strip())
+        gcal = _gcal_day_url(start.strip())
+        # `link` keeps the universal URL (Google Calendar day view) so it's
+        # tappable on iPhone too. The Mac-only calshow alternate is only
+        # exposed through title_html.
         out.append(CalEvent(
             title=title.strip(),
             start=start.strip(),
@@ -295,9 +330,9 @@ def fetch_calendar(days: int) -> list[CalEvent]:
             calendar=cal.strip(),
             location=loc.strip(),
             notes=notes.strip()[:500],
-            link=calshow,
+            link=gcal or calshow,
             color=_rgb_to_hex(color.strip()),
-            title_html=_build_title_html(title.strip(), calshow),
+            title_html=_build_title_html(title.strip(), gcal, calshow),
         ))
     log.info("got %d calendar events", len(out))
     return out
