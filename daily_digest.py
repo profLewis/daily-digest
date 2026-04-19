@@ -741,16 +741,31 @@ def build_digest(cal_events: list[CalEvent],
     final_obj: dict = {}
     first_token_at: float | None = None
     last_heartbeat = t0
+    lines_seen = 0
+    bytes_seen = 0
     HEARTBEAT_EVERY_S = 10.0
 
+    log.info("ollama: opening POST %s/api/chat", CFG['ollama_url'].rstrip('/'))
     try:
         with urllib.request.urlopen(req, timeout=CFG["ollama_timeout"]) as resp:
-            log.info("ollama: connection open, waiting for first token "
-                     "(cold-start model load can take 10-60s)…")
+            te = resp.getheader("Transfer-Encoding") or "(none)"
+            cl = resp.getheader("Content-Length") or "(none)"
+            log.info(
+                "ollama: connection open (HTTP %s, Transfer-Encoding=%s, "
+                "Content-Length=%s) — reading stream…",
+                resp.status, te, cl,
+            )
+            # Explicit readline() loop instead of `for raw in resp` so we
+            # can track bytes/lines and detect a silent empty response.
             # NDJSON: one JSON object per line. Non-final lines carry an
             # incremental message.content; the final line has done=true and
             # the timing/token stats but no content.
-            for raw in resp:
+            while True:
+                raw = resp.readline()
+                if not raw:
+                    break
+                lines_seen += 1
+                bytes_seen += len(raw)
                 if not raw.strip():
                     continue
                 try:
@@ -776,6 +791,8 @@ def build_digest(cal_events: list[CalEvent],
                     log.info("ollama: streaming… %d chars in %.0fs (~%.0f chars/s)",
                              chars_so_far, elapsed_s, rate)
                     last_heartbeat = now
+            log.info("ollama: stream ended (%d lines, %d bytes read)",
+                     lines_seen, bytes_seen)
     except urllib.error.URLError as exc:
         raise RuntimeError(
             f"ollama request failed: {exc}. Is 'ollama serve' running at "
@@ -783,6 +800,15 @@ def build_digest(cal_events: list[CalEvent],
             f"pulled? Try:  ollama pull {CFG['ollama_model']}"
         ) from exc
     elapsed = (dt.datetime.now() - t0).total_seconds()
+    if not chunks:
+        log.error(
+            "ollama: stream produced 0 content tokens in %.1fs "
+            "(read %d lines / %d bytes from server). The model may have "
+            "rejected the prompt as too long, or the server returned an "
+            "error response. Try a smaller prompt (lower DIGEST_EMAIL_DAYS) "
+            "or a model with more context.",
+            elapsed, lines_seen, bytes_seen,
+        )
 
     html = "".join(chunks).strip()
     stats = {
@@ -1154,7 +1180,8 @@ def main() -> int:
         html, stats = build_digest(cal, mail, messages, yesterday)
         if not html:
             log.error("empty digest from local model, aborting")
-            return 1
+            rc = 1
+            return rc
 
         # Append a colour legend and provenance footer (rendered in
         # Python for determinism). yesterday.html keeps the model's raw
