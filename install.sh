@@ -24,6 +24,25 @@ warn() { echo "  ${Y}!${N} $*"; }
 die()  { echo "${R}ERROR:${N} $*" >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
+# 0. Required sibling files
+# ---------------------------------------------------------------------------
+# install.sh expects to live alongside the rest of the repo. If a user
+# downloaded only this script (e.g. with curl), point them at git clone
+# rather than failing later with a confusing chmod / sed error.
+missing=()
+for f in run.sh daily_digest.py uninstall.sh; do
+    [[ -f "$REPO_DIR/$f" ]] || missing+=("$f")
+done
+if (( ${#missing[@]} > 0 )); then
+    die "missing required files in $REPO_DIR: ${missing[*]}
+   It looks like you only downloaded install.sh. Get the whole repo with:
+       git clone https://github.com/profLewis/daily-digest.git
+       cd daily-digest && ./install.sh"
+fi
+# Note: com.user.dailydigest.plist.template is no longer required as a
+# sibling file — the launchd plist is generated inline below (step 9).
+
+# ---------------------------------------------------------------------------
 # 1. Prerequisites
 # ---------------------------------------------------------------------------
 say "Checking prerequisites"
@@ -578,13 +597,42 @@ if launchctl list | grep -q "$LAUNCHD_LABEL"; then
     ok "unloaded previous agent"
 fi
 
-# Render template
-sed -e "s|__REPO_DIR__|$REPO_DIR|g" \
-    -e "s|__LOG_DIR__|$LOG_DIR|g" \
-    -e "s|__HOUR__|$HOUR|g" \
-    -e "s|__MINUTE__|$MINUTE|g" \
-    "$REPO_DIR/com.user.dailydigest.plist.template" \
-    > "$LAUNCHD_PLIST"
+# Generate the plist inline rather than reading an external template, so
+# install.sh doesn't depend on a sibling .template file being present.
+# (com.user.dailydigest.plist.template in the repo is kept for reference
+# but is not consulted here.)
+cat > "$LAUNCHD_PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$LAUNCHD_LABEL</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>$REPO_DIR/run.sh</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>$HOUR</integer>
+        <key>Minute</key>
+        <integer>$MINUTE</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>$LOG_DIR/daily-digest.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>$LOG_DIR/daily-digest.stderr.log</string>
+</dict>
+</plist>
+EOF
 launchctl load "$LAUNCHD_PLIST"
 ok "agent installed and loaded ($LAUNCHD_PLIST)"
 

@@ -96,16 +96,9 @@ class CalEvent:
     calendar: str
     location: str
     notes: str
-<<<<<<< HEAD
-    link: str             # calshow: URL that opens Calendar on that day
-    color: str            # calendar colour as #rrggbb
-    title_html: str = ""  # pre-rendered <a href=calshow:…>Title</a> for Claude
-=======
     link: str          # calshow: URL that opens Calendar on that day
     color: str         # calendar colour as #rrggbb
     title_html: str = ""  # pre-rendered <a href=calshow:…>Title</a> for the model
-
->>>>>>> f88aa3c ( Changes to be committed:)
 
 @dataclass
 class MailItem:
@@ -114,18 +107,10 @@ class MailItem:
     date: str
     message_id: str
     snippet: str
-<<<<<<< HEAD
-    link_mail_app: str    # message:<id> — Apple Mail, if mailbox is set up there
-    link_gmail_web: str   # https://mail.google.com/mail/?authuser=…#search/rfc822msgid:…
-    source: str = "gmail_imap"  # "gmail_imap" or "mail_app"
-    subject_html: str = ""      # pre-rendered <a href=…>Subject</a> for Claude
-=======
     link_mail_app: str  # message:<id> — Apple Mail, if mailbox is set up there
     link_gmail_web: str # https://mail.google.com/mail/?authuser=…#search/rfc822msgid:…
     source: str = "gmail_imap"  # "gmail_imap" or "mail_app"
     subject_html: str = ""      # pre-rendered <a href=…>Subject</a> for the model
-
->>>>>>> f88aa3c ( Changes to be committed:)
 
 @dataclass
 class ChatMessage:
@@ -260,15 +245,8 @@ def _build_subject_html(item: "MailItem", gmail_address: str) -> str:
     the alternate is appended as a small "(in Mail)" link."""
     subject_text = item.subject or "(no subject)"
     safe_subject = html_mod.escape(subject_text)
-<<<<<<< HEAD
-
     gmail_url = _gmail_web_link(item.message_id, gmail_address) if item.message_id else ""
     apple_url = _mailto_apple_link(item.message_id)
-
-=======
-    gmail_url = _gmail_web_link(item.message_id, gmail_address) if item.message_id else ""
-    apple_url = _mailto_apple_link(item.message_id)
->>>>>>> f88aa3c ( Changes to be committed:)
     # Prefer the Gmail web link when present (most robust); else Apple Mail.
     if gmail_url:
         primary = gmail_url
@@ -278,10 +256,6 @@ def _build_subject_html(item: "MailItem", gmail_address: str) -> str:
         alt = ""
     else:
         return f"<em>{safe_subject}</em>"  # no link at all
-<<<<<<< HEAD
-
-=======
->>>>>>> f88aa3c ( Changes to be committed:)
     out = f'<a href="{html_mod.escape(primary, quote=True)}">{safe_subject}</a>'
     if alt:
         out += (f' <a href="{html_mod.escape(alt, quote=True)}" '
