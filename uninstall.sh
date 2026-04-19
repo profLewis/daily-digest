@@ -2,7 +2,7 @@
 # uninstall.sh — undo everything install.sh did that we can undo
 # automatically, and print clear manual steps for everything macOS won't
 # let us touch programmatically (Automation permissions, Full Disk
-# Access, sudo pmset schedules, third-party API keys).
+# Access, sudo pmset schedules).
 #
 #   ./uninstall.sh            remove agent, config, lockfile, Keychain items
 #   ./uninstall.sh --purge    also remove state dir and log files
@@ -22,12 +22,11 @@ else
     B=""; G=""; Y=""; N=""
 fi
 say()  { echo "${B}==>${N} $*"; }
-ok()   { echo "    ${G}✓${N} $*"; }
-warn() { echo "    ${Y}!${N} $*"; }
+ok()   { echo "  ${G}✓${N} $*"; }
+warn() { echo "  ${Y}!${N} $*"; }
 
 PURGE=false
 [[ "${1:-}" == "--purge" ]] && PURGE=true
-
 
 # ---------------------------------------------------------------------------
 # 1. Stop and remove the launchd agent
@@ -46,7 +45,6 @@ else
     ok "plist not present"
 fi
 
-
 # ---------------------------------------------------------------------------
 # 2. Kill any still-running daily_digest.py (belt-and-braces)
 # ---------------------------------------------------------------------------
@@ -57,7 +55,6 @@ if pgrep -f 'daily_digest\.py' >/dev/null 2>&1; then
 else
     ok "no running instances"
 fi
-
 
 # ---------------------------------------------------------------------------
 # 3. Config, lockfile, Keychain
@@ -83,12 +80,11 @@ if security delete-generic-password -s daily-digest-gmail 2>/dev/null; then
 else
     ok "Gmail Keychain entry not present"
 fi
+# Older versions of this tool stored an Anthropic API key in the Keychain
+# (item 'daily-digest-anthropic'). Clean it up if it's still there.
 if security delete-generic-password -s daily-digest-anthropic 2>/dev/null; then
-    ok "removed Anthropic API key from Keychain"
-else
-    ok "Anthropic Keychain entry not present"
+    ok "removed obsolete Anthropic Keychain entry from a prior install"
 fi
-
 
 # ---------------------------------------------------------------------------
 # 4. State + logs (only under --purge)
@@ -115,7 +111,6 @@ else
     warn "pass --purge to delete them"
 fi
 
-
 # ---------------------------------------------------------------------------
 # 5. Manual steps we can't do programmatically — print them loudly
 # ---------------------------------------------------------------------------
@@ -125,28 +120,35 @@ ${B}Local state removed.${N} A few things macOS or third parties own that
 we ${B}cannot${N} remove automatically — do these manually if you want a
 fully clean slate:
 
-  ${B}macOS permissions${N} (System Settings → Privacy & Security):
-    • Automation     → remove any "Calendar" or "Mail" entries for bash,
-                       osascript, or your terminal.
-    • Full Disk Access → remove /bin/bash if you added it for this
-                       tool, and your terminal if you added it for
-                       iMessage testing.
+${B}macOS permissions${N} (System Settings → Privacy & Security):
+  • Automation       → remove any "Calendar" or "Mail" entries for bash,
+                        osascript, or your terminal.
+  • Full Disk Access → remove /bin/bash if you added it for this
+                        tool, and your terminal if you added it for
+                        iMessage testing.
 
-  ${B}Scheduled wake${N} (if you set one up per the README):
-    sudo pmset repeat cancel
+${B}Scheduled wake${N} (if you set one up per the README):
+  sudo pmset repeat cancel
 
-  ${B}Third-party credentials${N} (the Keychain copies are gone, but the
-  credentials themselves still exist upstream):
-    • Revoke the Gmail app password:
-        https://myaccount.google.com/apppasswords
-    • Revoke the Anthropic API key:
-        https://console.anthropic.com/settings/keys
+${B}Third-party credentials${N} (the Keychain copy is gone, but the
+Gmail app password itself still exists upstream):
+  • Revoke the Gmail app password:
+      https://myaccount.google.com/apppasswords
 
-  ${B}Python package${N} (left in place in case other tools use it):
-    pip3 uninstall anthropic
+${B}Local model backend${N} (left in place — you probably use Ollama for
+other things):
+  • If install.sh started Ollama via 'brew services', it's still running.
+    To stop it without uninstalling:
+      brew services stop ollama
+  • To remove the package entirely (Homebrew install):
+      brew services stop ollama
+      brew uninstall ollama
+      rm -rf ~/.ollama                # pulled model weights (many GB)
+  • To remove Ollama.app (manual install): quit it from the menu bar,
+    drag the app to Trash, and rm -rf ~/.ollama.
 
-  ${B}The repo itself${N} (untouched so you can reinstall if you want):
-    rm -rf "$REPO_DIR"
+${B}The repo itself${N} (untouched so you can reinstall if you want):
+  rm -rf "$REPO_DIR"
 
 ${G}Done.${N}
 EOF

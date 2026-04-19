@@ -1,1 +1,4 @@
-anthropic>=0.40
+# No third-party Python dependencies — everything is stdlib
+# (imaplib, smtplib, urllib, sqlite3, email, subprocess).
+#
+# The LLM call goes over plain HTTP to a local Ollama instance.

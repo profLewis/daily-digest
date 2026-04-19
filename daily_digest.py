@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """
 Daily digest: pulls upcoming Calendar events + recent Gmail threads,
-asks Claude to produce a clean digest (events from emails not yet in
-calendar are flagged), and emails the result.
+asks a local Ollama model to produce a clean digest (events from emails
+not yet in calendar are flagged), and emails the result.
 
 Usage:
-    daily_digest.py              # full run: fetch, build, send, persist state
-    daily_digest.py --dry-run    # fetch + build + write preview.html, no email
+    daily_digest.py            # full run: fetch, build, send, persist state
+    daily_digest.py --dry-run  # fetch + build + write preview.html, no email
 
 Designed for macOS, runs under launchd at 02:00 local time.
 See README.md for install and configuration.
 """
-
 from __future__ import annotations
 
 import argparse
@@ -30,13 +29,12 @@ import html as html_mod
 import ssl
 import subprocess
 import sys
+import urllib.error
 import urllib.parse
+import urllib.request
 from dataclasses import dataclass, asdict
 from email.mime.text import MIMEText
 from pathlib import Path
-
-import anthropic
-
 
 # ---------------------------------------------------------------------------
 # Config — everything comes from environment variables so nothing sensitive
@@ -53,26 +51,26 @@ def _require_env(key: str) -> str:
         sys.exit(2)
     return val
 
-
 CFG = {
-    "gmail_address":     _require_env("DIGEST_GMAIL_ADDRESS"),
-    "gmail_app_pw":      _require_env("DIGEST_GMAIL_APP_PW"),
-    "recipient":         os.environ.get("DIGEST_RECIPIENT")
-                         or _require_env("DIGEST_GMAIL_ADDRESS"),
-    "anthropic_key":     _require_env("ANTHROPIC_API_KEY"),
-    "anthropic_model":   os.environ.get("ANTHROPIC_MODEL", "claude-opus-4-7"),
-    "calendar_days":     int(os.environ.get("DIGEST_CAL_DAYS", "14")),
-    "email_days":        int(os.environ.get("DIGEST_EMAIL_DAYS", "3")),
-    "keep_days":         int(os.environ.get("DIGEST_KEEP_DAYS", "1")),
-    "use_mail_app":      os.environ.get("DIGEST_USE_MAIL_APP", "false").lower() == "true",
-    "use_imessage":      os.environ.get("DIGEST_USE_IMESSAGE", "false").lower() == "true",
-    "imessage_days":     int(os.environ.get("DIGEST_IMESSAGE_DAYS", "3")),
-    "state_dir":         Path(os.environ.get(
-                            "DIGEST_STATE_DIR",
-                            Path.home() / ".local" / "share" / "daily-digest")),
-    "log_file":          Path(os.environ.get(
-                            "DIGEST_LOG_FILE",
-                            Path.home() / "Library" / "Logs" / "daily-digest.log")),
+    "gmail_address": _require_env("DIGEST_GMAIL_ADDRESS"),
+    "gmail_app_pw": _require_env("DIGEST_GMAIL_APP_PW"),
+    "recipient": os.environ.get("DIGEST_RECIPIENT")
+                 or _require_env("DIGEST_GMAIL_ADDRESS"),
+    "ollama_url": os.environ.get("OLLAMA_URL", "http://localhost:11434"),
+    "ollama_model": os.environ.get("OLLAMA_MODEL", "llama3.1:8b"),
+    "ollama_timeout": int(os.environ.get("OLLAMA_TIMEOUT", "600")),
+    "calendar_days": int(os.environ.get("DIGEST_CAL_DAYS", "14")),
+    "email_days": int(os.environ.get("DIGEST_EMAIL_DAYS", "3")),
+    "keep_days": int(os.environ.get("DIGEST_KEEP_DAYS", "1")),
+    "use_mail_app": os.environ.get("DIGEST_USE_MAIL_APP", "false").lower() == "true",
+    "use_imessage": os.environ.get("DIGEST_USE_IMESSAGE", "false").lower() == "true",
+    "imessage_days": int(os.environ.get("DIGEST_IMESSAGE_DAYS", "3")),
+    "state_dir": Path(os.environ.get(
+        "DIGEST_STATE_DIR",
+        Path.home() / ".local" / "share" / "daily-digest")),
+    "log_file": Path(os.environ.get(
+        "DIGEST_LOG_FILE",
+        Path.home() / "Library" / "Logs" / "daily-digest.log")),
 }
 
 CFG["state_dir"].mkdir(parents=True, exist_ok=True)
@@ -84,7 +82,6 @@ logging.basicConfig(
     handlers=[logging.FileHandler(CFG["log_file"]), logging.StreamHandler()],
 )
 log = logging.getLogger("daily-digest")
-
 
 # ---------------------------------------------------------------------------
 # Data shapes
@@ -99,9 +96,16 @@ class CalEvent:
     calendar: str
     location: str
     notes: str
+<<<<<<< HEAD
     link: str             # calshow: URL that opens Calendar on that day
     color: str            # calendar colour as #rrggbb
     title_html: str = ""  # pre-rendered <a href=calshow:…>Title</a> for Claude
+=======
+    link: str          # calshow: URL that opens Calendar on that day
+    color: str         # calendar colour as #rrggbb
+    title_html: str = ""  # pre-rendered <a href=calshow:…>Title</a> for the model
+
+>>>>>>> f88aa3c ( Changes to be committed:)
 
 @dataclass
 class MailItem:
@@ -110,18 +114,26 @@ class MailItem:
     date: str
     message_id: str
     snippet: str
+<<<<<<< HEAD
     link_mail_app: str    # message:<id> — Apple Mail, if mailbox is set up there
     link_gmail_web: str   # https://mail.google.com/mail/?authuser=…#search/rfc822msgid:…
     source: str = "gmail_imap"  # "gmail_imap" or "mail_app"
     subject_html: str = ""      # pre-rendered <a href=…>Subject</a> for Claude
+=======
+    link_mail_app: str  # message:<id> — Apple Mail, if mailbox is set up there
+    link_gmail_web: str # https://mail.google.com/mail/?authuser=…#search/rfc822msgid:…
+    source: str = "gmail_imap"  # "gmail_imap" or "mail_app"
+    subject_html: str = ""      # pre-rendered <a href=…>Subject</a> for the model
+
+>>>>>>> f88aa3c ( Changes to be committed:)
 
 @dataclass
 class ChatMessage:
     """iMessage or SMS pulled from Messages.app local store."""
-    platform: str         # "imessage"
-    sender: str           # phone number, email, or "me"
-    date: str             # ISO 8601
-    text: str             # body, truncated
+    platform: str       # "imessage"
+    sender: str         # phone number, email, or "me"
+    date: str           # ISO 8601
+    text: str           # body, truncated
     is_from_me: bool
 
 
@@ -135,7 +147,6 @@ on run argv
     set daysAhead to (item 1 of argv) as integer
     set startDate to current date
     set endDate to startDate + (daysAhead * days)
-
     set output to ""
     tell application "Calendar"
         repeat with c in calendars
@@ -188,7 +199,6 @@ on run argv
     return output
 end run
 """
-
 
 def _rgb_to_hex(triplet: str) -> str:
     """Convert 'r,g,b' (0-255 each) to '#rrggbb'. Returns #808080 on junk."""
@@ -250,10 +260,15 @@ def _build_subject_html(item: "MailItem", gmail_address: str) -> str:
     the alternate is appended as a small "(in Mail)" link."""
     subject_text = item.subject or "(no subject)"
     safe_subject = html_mod.escape(subject_text)
+<<<<<<< HEAD
 
     gmail_url = _gmail_web_link(item.message_id, gmail_address) if item.message_id else ""
     apple_url = _mailto_apple_link(item.message_id)
 
+=======
+    gmail_url = _gmail_web_link(item.message_id, gmail_address) if item.message_id else ""
+    apple_url = _mailto_apple_link(item.message_id)
+>>>>>>> f88aa3c ( Changes to be committed:)
     # Prefer the Gmail web link when present (most robust); else Apple Mail.
     if gmail_url:
         primary = gmail_url
@@ -263,7 +278,10 @@ def _build_subject_html(item: "MailItem", gmail_address: str) -> str:
         alt = ""
     else:
         return f"<em>{safe_subject}</em>"  # no link at all
+<<<<<<< HEAD
 
+=======
+>>>>>>> f88aa3c ( Changes to be committed:)
     out = f'<a href="{html_mod.escape(primary, quote=True)}">{safe_subject}</a>'
     if alt:
         out += (f' <a href="{html_mod.escape(alt, quote=True)}" '
@@ -342,7 +360,6 @@ def _extract_text(msg: email.message.Message) -> str:
 def fetch_gmail(days: int) -> list[MailItem]:
     log.info("gmail: IMAP login as %s (last %d days)", CFG["gmail_address"], days)
     since = (dt.date.today() - dt.timedelta(days=days)).strftime("%d-%b-%Y")
-
     out: list[MailItem] = []
     with imaplib.IMAP4_SSL("imap.gmail.com", 993) as M:
         M.login(CFG["gmail_address"], CFG["gmail_app_pw"])
@@ -471,7 +488,6 @@ on clean(s, sep)
 end clean
 """
 
-
 def fetch_mail_app(days: int) -> list[MailItem]:
     log.info("mail.app: AppleScript read of inbox messages (last %d days)", days)
     res = subprocess.run(
@@ -521,24 +537,20 @@ def merge_mail(primary: list[MailItem],
 
 # ---------------------------------------------------------------------------
 # iMessage / SMS via ~/Library/Messages/chat.db
-# Gated by DIGEST_USE_IMESSAGE=true. Opt-in because it sends personal
-# chat content to Claude. Requires Full Disk Access for whoever runs
-# the script (/bin/bash under launchd; the terminal emulator when run
-# manually).
+# Gated by DIGEST_USE_IMESSAGE=true. Opt-in because it reads personal
+# chat content. Requires Full Disk Access for whoever runs the script
+# (/bin/bash under launchd; the terminal emulator when run manually).
 # ---------------------------------------------------------------------------
 
 _APPLE_EPOCH = dt.datetime(2001, 1, 1, tzinfo=dt.timezone.utc)
-
 
 def fetch_imessages(days: int) -> list[ChatMessage]:
     db = Path.home() / "Library" / "Messages" / "chat.db"
     if not db.exists():
         log.warning("imessage: %s not found, skipping", db)
         return []
-
     since_dt = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
     since_ns = int((since_dt - _APPLE_EPOCH).total_seconds() * 1_000_000_000)
-
     log.info("imessage: reading chat.db (last %d days)", days)
     import sqlite3
     try:
@@ -547,19 +559,18 @@ def fetch_imessages(days: int) -> list[ChatMessage]:
         log.error("imessage: cannot open chat.db (%s). Ensure Full Disk "
                   "Access is granted to whoever runs this script.", exc)
         return []
-
     out: list[ChatMessage] = []
     try:
         cur = con.cursor()
         cur.execute(
             """
             SELECT handle.id, message.date, message.text, message.is_from_me
-              FROM message
-              LEFT JOIN handle ON message.handle_id = handle.ROWID
-             WHERE message.date >= ?
-               AND message.text IS NOT NULL
-               AND length(message.text) > 0
-             ORDER BY message.date ASC
+            FROM message
+            LEFT JOIN handle ON message.handle_id = handle.ROWID
+            WHERE message.date >= ?
+              AND message.text IS NOT NULL
+              AND length(message.text) > 0
+            ORDER BY message.date ASC
             """,
             (since_ns,),
         )
@@ -578,61 +589,15 @@ def fetch_imessages(days: int) -> list[ChatMessage]:
             ))
     finally:
         con.close()
-
     log.info("imessage: fetched %d messages", len(out))
     return out
 
 
 # ---------------------------------------------------------------------------
-# Claude: produce the digest
+# Local model (Ollama): produce the digest
 # ---------------------------------------------------------------------------
 
-# USD per million tokens. List prices only — your actual bill may differ
-# depending on discounts, batch usage, or pricing changes. Check
-# https://www.anthropic.com/pricing for canonical numbers. Models not in
-# this table still run; cost is just reported as "unknown".
-MODEL_PRICING_USD_PER_MTOKEN = {
-    "claude-opus-4-7":   {"input": 15.0, "output": 75.0},
-    "claude-opus-4-6":   {"input": 15.0, "output": 75.0},
-    "claude-opus-4-5":   {"input": 15.0, "output": 75.0},
-    "claude-sonnet-4-6": {"input":  3.0, "output": 15.0},
-    "claude-sonnet-4-5": {"input":  3.0, "output": 15.0},
-    "claude-haiku-4-5":  {"input":  1.0, "output":  5.0},
-}
-
-
-def _price_for(model: str) -> dict | None:
-    """Find pricing for a model, matching exact id or a prefix (so dated
-    variants like claude-haiku-4-5-20251001 still resolve)."""
-    if model in MODEL_PRICING_USD_PER_MTOKEN:
-        return MODEL_PRICING_USD_PER_MTOKEN[model]
-    for k, v in MODEL_PRICING_USD_PER_MTOKEN.items():
-        if model.startswith(k):
-            return v
-    return None
-
-
-def _estimate_cost_usd(model: str, usage) -> float | None:
-    """Estimate USD cost from a messages.create usage object. Cache reads
-    are billed at 10% of input rate, cache writes at 125% — if the
-    library reports them we account for them separately."""
-    price = _price_for(model)
-    if not price:
-        return None
-    inp    = getattr(usage, "input_tokens", 0) or 0
-    out    = getattr(usage, "output_tokens", 0) or 0
-    c_read = getattr(usage, "cache_read_input_tokens", 0) or 0
-    c_wrt  = getattr(usage, "cache_creation_input_tokens", 0) or 0
-    return (
-        inp    * price["input"]           +
-        out    * price["output"]          +
-        c_read * price["input"] * 0.10    +
-        c_wrt  * price["input"] * 1.25
-    ) / 1_000_000
-
-
 SYSTEM_PROMPT = """You produce a crisp daily digest for the user's morning.
-
 Input: calendar events for the next N days, recent emails, recent chat
 messages (iMessage/SMS, may be empty), and yesterday's digest.
 
@@ -681,65 +646,66 @@ def build_digest(cal_events: list[CalEvent],
                  emails: list[MailItem],
                  messages: list[ChatMessage],
                  yesterday_html: str) -> tuple[str, dict]:
-    """Return (html, stats). stats has input_tokens, output_tokens,
-    cache_read, cache_creation, and cost_usd (None if model unknown)."""
-    client = anthropic.Anthropic(api_key=CFG["anthropic_key"])
-
+    """Return (html, stats). stats has input_tokens, output_tokens, and
+    elapsed_s. Token counts come from Ollama's prompt_eval_count and
+    eval_count. Elapsed is wall-clock for the generate call."""
     payload = {
         "today": dt.date.today().isoformat(),
         "calendar_window_days": CFG["calendar_days"],
         "calendar": [asdict(e) for e in cal_events],
-        "emails":   [asdict(m) for m in emails],
+        "emails": [asdict(m) for m in emails],
         "messages": [asdict(m) for m in messages],
         "yesterday_digest_html": yesterday_html,
     }
-
-    log.info("anthropic: calling %s (1 messages.create, max_tokens=4000)",
-             CFG["anthropic_model"])
-    msg = client.messages.create(
-        model=CFG["anthropic_model"],
-        max_tokens=4000,
-        system=SYSTEM_PROMPT,
-        messages=[{
-            "role": "user",
-            "content": (
-                "Here is today's input. Produce the digest as specified.\n\n"
-                f"```json\n{json.dumps(payload, indent=2, default=str)}\n```"
-            ),
-        }],
+    user_content = (
+        "Here is today's input. Produce the digest as specified.\n\n"
+        f"```json\n{json.dumps(payload, indent=2, default=str)}\n```"
     )
-
-    usage = getattr(msg, "usage", None)
-    stats = {
-        "model": CFG["anthropic_model"],
-        "input_tokens": 0, "output_tokens": 0,
-        "cache_read": 0, "cache_creation": 0,
-        "cost_usd": None,
+    body = {
+        "model": CFG["ollama_model"],
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ],
+        "stream": False,
+        "options": {
+            # Keep it deterministic-ish for day-to-day continuity.
+            "temperature": 0.2,
+            "num_predict": 4000,
+        },
     }
-    if usage is not None:
-        stats["input_tokens"]   = getattr(usage, "input_tokens", 0) or 0
-        stats["output_tokens"]  = getattr(usage, "output_tokens", 0) or 0
-        stats["cache_read"]     = getattr(usage, "cache_read_input_tokens", 0) or 0
-        stats["cache_creation"] = getattr(usage, "cache_creation_input_tokens", 0) or 0
-        stats["cost_usd"]       = _estimate_cost_usd(CFG["anthropic_model"], usage)
-        log.info(
-            "anthropic: usage model=%s input_tokens=%d output_tokens=%d "
-            "cache_read=%d cache_creation=%d",
-            stats["model"], stats["input_tokens"], stats["output_tokens"],
-            stats["cache_read"], stats["cache_creation"],
-        )
-        if stats["cost_usd"] is not None:
-            log.info("anthropic: estimated cost USD $%.4f "
-                     "(list price; actual bill in console)", stats["cost_usd"])
-        else:
-            log.info("anthropic: cost estimate unavailable "
-                     "(model %s not in pricing table)", stats["model"])
-    else:
-        log.warning("anthropic: no usage returned on response")
+    log.info("ollama: calling %s at %s (timeout=%ds)",
+             CFG["ollama_model"], CFG["ollama_url"], CFG["ollama_timeout"])
+    req = urllib.request.Request(
+        f"{CFG['ollama_url']}/api/chat",
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    t0 = dt.datetime.now()
+    try:
+        with urllib.request.urlopen(req, timeout=CFG["ollama_timeout"]) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.URLError as exc:
+        raise RuntimeError(
+            f"ollama request failed: {exc}. Is 'ollama serve' running at "
+            f"{CFG['ollama_url']}, and is the model '{CFG['ollama_model']}' "
+            f"pulled? Try:  ollama pull {CFG['ollama_model']}"
+        ) from exc
+    elapsed = (dt.datetime.now() - t0).total_seconds()
 
-    html = "".join(
-        block.text for block in msg.content if getattr(block, "type", "") == "text"
-    ).strip()
+    html = ((data.get("message") or {}).get("content") or "").strip()
+    stats = {
+        "model": CFG["ollama_model"],
+        "input_tokens": int(data.get("prompt_eval_count", 0) or 0),
+        "output_tokens": int(data.get("eval_count", 0) or 0),
+        "elapsed_s": elapsed,
+    }
+    log.info(
+        "ollama: usage model=%s prompt_eval=%d eval=%d elapsed=%.1fs",
+        stats["model"], stats["input_tokens"], stats["output_tokens"],
+        stats["elapsed_s"],
+    )
     return html, stats
 
 
@@ -750,7 +716,7 @@ def build_digest(cal_events: list[CalEvent],
 def _build_calendar_legend(cal_events: list[CalEvent]) -> str:
     """Render a small legend box listing each calendar present in the
     digest with its colour swatch — like a map key. Rendered in Python
-    rather than asked of Claude so the visual is deterministic."""
+    rather than asked of the model so the visual is deterministic."""
     seen: dict[str, str] = {}
     for e in cal_events:
         if e.calendar and e.calendar not in seen:
@@ -775,14 +741,13 @@ def _build_calendar_legend(cal_events: list[CalEvent]) -> str:
 
 REPO_URL = "https://github.com/profLewis/daily-digest"
 
-
 def _build_footer() -> str:
     """Provenance footer: which machine, which user, which repo. Lets the
     recipient verify the source and distinguish digests from multiple
     machines if they run it on more than one."""
     host = platform.node() or "unknown-host"
     user = os.environ.get("USER") or os.environ.get("LOGNAME") or "?"
-    now  = dt.datetime.now().strftime("%Y-%m-%d %H:%M %Z").strip()
+    now = dt.datetime.now().strftime("%Y-%m-%d %H:%M %Z").strip()
     return (
         '\n<hr style="border:none;border-top:1px solid #eee;margin-top:18px">\n'
         '<div style="font-size:0.8em;color:#888;margin-top:8px;line-height:1.4">'
@@ -795,9 +760,9 @@ def _build_footer() -> str:
 
 
 def _wrap_html(fragment: str) -> str:
-    """Wrap Claude's HTML fragment in a minimal document so browsers and
-    mail clients render UTF-8 correctly. Without <meta charset> browsers
-    fall back to Latin-1 and em-dashes render as â€"."""
+    """Wrap the model's HTML fragment in a minimal document so browsers
+    and mail clients render UTF-8 correctly. Without <meta charset>
+    browsers fall back to Latin-1 and em-dashes render as â€"."""
     return (
         '<!DOCTYPE html>\n'
         '<html lang="en"><head>'
@@ -815,7 +780,7 @@ def load_yesterday() -> str:
 
 
 def save_today(html_for_continuity: str, html_for_archive: str) -> None:
-    """yesterday.html stores Claude's raw fragment (fed back verbatim
+    """yesterday.html stores the model's raw fragment (fed back verbatim
     tomorrow). The dated archive is a wrapped, human-friendly copy."""
     (CFG["state_dir"] / "yesterday.html").write_text(
         html_for_continuity, encoding="utf-8")
@@ -834,11 +799,9 @@ def trash_old_digests(keep_days: int) -> None:
     if keep_days < 1:
         log.info("digest cleanup disabled (DIGEST_KEEP_DAYS=%d)", keep_days)
         return
-
     cutoff = dt.date.today() - dt.timedelta(days=keep_days - 1)
     before = cutoff.strftime("%d-%b-%Y")
     addr = CFG["gmail_address"]
-
     log.info("trashing digests from %s before %s", addr, before)
     with imaplib.IMAP4_SSL("imap.gmail.com", 993) as M:
         M.login(addr, CFG["gmail_app_pw"])
@@ -858,7 +821,6 @@ def trash_old_digests(keep_days: int) -> None:
         if not uids:
             log.info("no old digests to trash")
             return
-
         uid_str = b",".join(uids).decode()
         try:
             M.uid("MOVE", uid_str, '"[Gmail]/Trash"')
@@ -876,7 +838,6 @@ def send_email(html_body: str) -> None:
     msg["Subject"] = f"Daily digest — {today}"
     msg["From"] = CFG["gmail_address"]
     msg["To"] = CFG["recipient"]
-
     log.info("smtp: sending digest to %s (%d bytes)",
              CFG["recipient"], len(msg.as_bytes()))
     with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ssl.create_default_context()) as s:
@@ -943,11 +904,11 @@ def main() -> int:
         yesterday = load_yesterday()
         html, stats = build_digest(cal, mail, messages, yesterday)
         if not html:
-            log.error("empty digest from Claude, aborting")
+            log.error("empty digest from local model, aborting")
             return 1
 
         # Append a colour legend and provenance footer (rendered in
-        # Python for determinism). yesterday.html keeps Claude's raw
+        # Python for determinism). yesterday.html keeps the model's raw
         # output only, so tomorrow's continuity context isn't polluted
         # with the legend and footer markup.
         html_with_legend = html + _build_calendar_legend(cal) + _build_footer()
@@ -957,7 +918,7 @@ def main() -> int:
             preview.write_text(_wrap_html(html_with_legend), encoding="utf-8")
             log.info("dry run — preview at %s", preview)
             print(f"\nPreview written: {preview}")
-            print(f"Open it:        open {preview}")
+            print(f"Open it:         open {preview}")
             return 0
 
         # Clean up old digests before sending today's, so tomorrow's
@@ -971,22 +932,22 @@ def main() -> int:
         send_email(html_with_legend)
         emailed = True
         return 0
+
     except Exception:
         log.exception("digest run failed")
         rc = 2
         return rc
     finally:
-        cost = stats.get("cost_usd")
-        cost_str = f"${cost:.4f}" if isinstance(cost, (int, float)) else "unknown"
+        elapsed = stats.get("elapsed_s")
+        elapsed_str = f"{elapsed:.1f}s" if isinstance(elapsed, (int, float)) else "n/a"
         log.info(
             "run summary: calendar_events=%d gmail_imap=%d mail_app=%d "
-            "imessages=%d anthropic_in=%d anthropic_out=%d "
-            "cache_read=%d cache_creation=%d estimated_cost_usd=%s "
+            "imessages=%d model=%s prompt_eval=%d eval=%d elapsed=%s "
             "emailed=%s dry_run=%s exit=%d",
             cal_n, mail_n, mail_app_n, imsg_n,
+            stats.get("model", CFG["ollama_model"]),
             stats.get("input_tokens", 0), stats.get("output_tokens", 0),
-            stats.get("cache_read", 0), stats.get("cache_creation", 0),
-            cost_str, emailed, args.dry_run, rc,
+            elapsed_str, emailed, args.dry_run, rc,
         )
 
 
