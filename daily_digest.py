@@ -69,6 +69,11 @@ CFG = {
     "ollama_url": os.environ.get("OLLAMA_URL", "http://localhost:11434"),
     "ollama_model": os.environ.get("OLLAMA_MODEL", "llama3.1:8b"),
     "ollama_timeout": int(os.environ.get("OLLAMA_TIMEOUT", "600")),
+    # Ollama's default context window is 2048 tokens — far too small for
+    # a busy-day digest prompt (50K+ tokens). Setting num_ctx forces the
+    # daemon to allocate a bigger window. Trade-off: more RAM/VRAM
+    # consumed. 0 means "use Ollama's default" (don't send the option).
+    "ollama_num_ctx": int(os.environ.get("OLLAMA_NUM_CTX", "0")),
     "openai_base_url": os.environ.get("OPENAI_BASE_URL", ""),
     "openai_model": os.environ.get("OPENAI_MODEL", ""),
     "openai_api_key": os.environ.get("OPENAI_API_KEY", ""),
@@ -738,6 +743,13 @@ def build_digest(cal_events: list[CalEvent],
 def _call_ollama(user_content: str, prompt_chars: int,
                  counts: tuple[int, int, int]) -> tuple[str, dict]:
     n_events, n_emails, n_messages = counts
+    options = {
+        # Keep it deterministic-ish for day-to-day continuity.
+        "temperature": 0.2,
+        "num_predict": 4000,
+    }
+    if CFG["ollama_num_ctx"] > 0:
+        options["num_ctx"] = CFG["ollama_num_ctx"]
     body = {
         "model": CFG["ollama_model"],
         "messages": [
@@ -748,17 +760,14 @@ def _call_ollama(user_content: str, prompt_chars: int,
         # for the entire generation (which on an 8B model + a busy day's
         # input can take a few minutes).
         "stream": True,
-        "options": {
-            # Keep it deterministic-ish for day-to-day continuity.
-            "temperature": 0.2,
-            "num_predict": 4000,
-        },
+        "options": options,
     }
+    ctx_note = f"num_ctx={CFG['ollama_num_ctx']}" if CFG["ollama_num_ctx"] > 0 else "num_ctx=default(2048)"
     log.info(
-        "ollama: calling %s at %s (timeout=%ds, prompt=%d chars: "
+        "ollama: calling %s at %s (timeout=%ds, %s, prompt=%d chars: "
         "%d events, %d emails, %d messages)",
         CFG["ollama_model"], CFG["ollama_url"], CFG["ollama_timeout"],
-        prompt_chars, n_events, n_emails, n_messages,
+        ctx_note, prompt_chars, n_events, n_emails, n_messages,
     )
     req = urllib.request.Request(
         f"{CFG['ollama_url']}/api/chat",
