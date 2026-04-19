@@ -25,6 +25,15 @@ DIGEST_GMAIL_APP_PW="$(security find-generic-password \
 
 export DIGEST_GMAIL_ADDRESS DIGEST_GMAIL_APP_PW
 
+# When the hosted backend is configured, pull its API key from Keychain
+# too. Skipped for the default (ollama) backend so the digest never
+# depends on a key that doesn't exist.
+if [[ "${DIGEST_BACKEND:-ollama}" == "openai_compatible" ]]; then
+    OPENAI_API_KEY="$(security find-generic-password \
+        -s daily-digest-openai -w)"
+    export OPENAI_API_KEY
+fi
+
 # Everything else (DIGEST_CAL_DAYS, OLLAMA_MODEL, OLLAMA_URL, etc.)
 # comes from config.env.
 cd "$(dirname "$0")"

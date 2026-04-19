@@ -97,6 +97,10 @@ if security delete-generic-password -s daily-digest-gmail 2>/dev/null; then
 else
     ok "Gmail Keychain entry not present"
 fi
+# Hosted backend's API key.
+if security delete-generic-password -s daily-digest-openai 2>/dev/null; then
+    ok "removed hosted-backend API key from Keychain"
+fi
 # Older versions of this tool stored an Anthropic API key in the Keychain
 # (item 'daily-digest-anthropic'). Clean it up if it's still there.
 if security delete-generic-password -s daily-digest-anthropic 2>/dev/null; then

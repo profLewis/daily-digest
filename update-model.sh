@@ -21,6 +21,15 @@ fi
 # shellcheck disable=SC1090
 source "$CONFIG"
 
+# Nothing to refresh when the digest is using a hosted provider — they
+# manage versioning on their end. Don't fail; the LaunchAgent fires
+# weekly regardless and we want a clean exit.
+if [[ "${DIGEST_BACKEND:-ollama}" != "ollama" ]]; then
+    echo "DIGEST_BACKEND=${DIGEST_BACKEND:-ollama}; nothing to pull. Exiting." \
+        | tee -a "$HOME/Library/Logs/daily-digest-update.log"
+    exit 0
+fi
+
 : "${OLLAMA_MODEL:?OLLAMA_MODEL missing from $CONFIG}"
 : "${OLLAMA_URL:=http://localhost:11434}"
 

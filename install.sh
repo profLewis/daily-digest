@@ -96,22 +96,134 @@ else
     APP_PW="$existing_pw"
 fi
 
-say "Local model backend (Ollama)"
+say "Backend"
 
-# Ollama URL — usually http://localhost:11434, but can be remote on the LAN.
-prev_ollama_url=""
-prev_ollama_model=""
+# Re-pick up previous backend choice on re-install so the user isn't
+# forced to re-decide every time.
+prev_backend="ollama"
 if [[ -f "$CONFIG_FILE" ]]; then
-    prev_ollama_url="$(awk -F'"' '/^OLLAMA_URL=/{print $2}' "$CONFIG_FILE" 2>/dev/null)"
-    prev_ollama_model="$(awk -F'"' '/^OLLAMA_MODEL=/{print $2}' "$CONFIG_FILE" 2>/dev/null)"
+    pb="$(awk -F'"' '/^DIGEST_BACKEND=/{print $2}' "$CONFIG_FILE" 2>/dev/null)"
+    [[ -n "$pb" ]] && prev_backend="$pb"
 fi
-default_url="${prev_ollama_url:-http://localhost:11434}"
-read -r -p "  Ollama URL [$default_url]: " OLLAMA_URL
-OLLAMA_URL="${OLLAMA_URL:-$default_url}"
 
-default_model="${prev_ollama_model:-llama3.1:8b}"
-read -r -p "  Ollama model tag [$default_model]: " OLLAMA_MODEL
-OLLAMA_MODEL="${OLLAMA_MODEL:-$default_model}"
+cat <<EOF
+  Two options:
+    (1) ollama              — runs locally on this machine. Personal
+                              content never leaves the host. Default,
+                              recommended.
+    (2) openai_compatible   — sends prompts to a hosted provider that
+                              speaks OpenAI's chat-completions API
+                              (DeepSeek, Moonshot/Kimi, Google Gemini's
+                              OpenAI-compat endpoint, Alibaba DashScope).
+                              Better quality, much faster, but every
+                              email subject + calendar event + iMessage
+                              you read is sent over the network.
+EOF
+read -r -p "  Backend [1=ollama, 2=openai_compatible, default=$prev_backend]: " backend_choice
+case "$backend_choice" in
+    1|ollama|"")           [[ -z "$backend_choice" ]] && BACKEND="$prev_backend" || BACKEND="ollama" ;;
+    2|openai|openai_compatible) BACKEND="openai_compatible" ;;
+    *) die "expected 1 or 2 (got '$backend_choice')" ;;
+esac
+ok "backend: $BACKEND"
+
+# Defaults for both branches; only one set will end up in config.env.
+OLLAMA_URL=""
+OLLAMA_MODEL=""
+OPENAI_BASE_URL=""
+OPENAI_MODEL=""
+OPENAI_API_KEY=""
+
+if [[ "$BACKEND" == "ollama" ]]; then
+    say "Local model backend (Ollama)"
+
+    prev_ollama_url=""
+    prev_ollama_model=""
+    if [[ -f "$CONFIG_FILE" ]]; then
+        prev_ollama_url="$(awk -F'"' '/^OLLAMA_URL=/{print $2}' "$CONFIG_FILE" 2>/dev/null)"
+        prev_ollama_model="$(awk -F'"' '/^OLLAMA_MODEL=/{print $2}' "$CONFIG_FILE" 2>/dev/null)"
+    fi
+    default_url="${prev_ollama_url:-http://localhost:11434}"
+    read -r -p "  Ollama URL [$default_url]: " OLLAMA_URL
+    OLLAMA_URL="${OLLAMA_URL:-$default_url}"
+
+    cat <<'EOF'
+  Suggested model tags:
+    1) llama3.1:8b        ~5 GB,  8K ctx (default; can overflow on busy days)
+    2) llama3.2:3b        ~2 GB,  128K ctx (fast, smaller quality)
+    3) qwen3:30b-a3b      ~20 GB, 256K ctx (MoE, much higher quality)
+    4) mistral-small3.2:24b  ~14 GB, 128K ctx (solid mid-size)
+    5) llama3.3:70b       ~40 GB, 128K ctx (best quality, RAM-hungry)
+    6) (custom)           type your own tag
+EOF
+    default_model="${prev_ollama_model:-llama3.1:8b}"
+    read -r -p "  Ollama model tag [$default_model]: " model_choice
+    case "$model_choice" in
+        1) OLLAMA_MODEL="llama3.1:8b" ;;
+        2) OLLAMA_MODEL="llama3.2:3b" ;;
+        3) OLLAMA_MODEL="qwen3:30b-a3b" ;;
+        4) OLLAMA_MODEL="mistral-small3.2:24b" ;;
+        5) OLLAMA_MODEL="llama3.3:70b" ;;
+        6) read -r -p "    custom tag: " OLLAMA_MODEL ;;
+        "") OLLAMA_MODEL="$default_model" ;;
+        *)  OLLAMA_MODEL="$model_choice" ;;
+    esac
+    [[ -n "$OLLAMA_MODEL" ]] || die "model tag can't be empty"
+    ok "model: $OLLAMA_MODEL"
+else
+    say "Hosted backend (openai_compatible)"
+
+    cat <<'EOF'
+  Reminder: every email subject, calendar event, and message you scan
+  will be sent over the network to this provider. Default privacy
+  posture is the local Ollama backend; switch back any time by
+  editing config.env.
+
+  Quick presets (you can also type your own URL):
+    1) deepseek    https://api.deepseek.com/v1     (deepseek-chat)
+    2) moonshot    https://api.moonshot.cn/v1      (moonshot-v1-32k)
+    3) gemini      https://generativelanguage.googleapis.com/v1beta/openai/  (gemini-2.5-pro)
+    4) dashscope   https://dashscope-intl.aliyuncs.com/compatible-mode/v1    (qwen-max)
+    5) (custom)    type your own base URL + model
+EOF
+
+    prev_base="$(awk -F'"' '/^OPENAI_BASE_URL=/{print $2}' "$CONFIG_FILE" 2>/dev/null || true)"
+    prev_model="$(awk -F'"' '/^OPENAI_MODEL=/{print $2}' "$CONFIG_FILE" 2>/dev/null || true)"
+
+    read -r -p "  Provider preset [1-5${prev_base:+, default=keep current}]: " preset
+    case "$preset" in
+        1) OPENAI_BASE_URL="https://api.deepseek.com/v1" ; OPENAI_MODEL="deepseek-chat" ;;
+        2) OPENAI_BASE_URL="https://api.moonshot.cn/v1" ; OPENAI_MODEL="moonshot-v1-32k" ;;
+        3) OPENAI_BASE_URL="https://generativelanguage.googleapis.com/v1beta/openai/" ; OPENAI_MODEL="gemini-2.5-pro" ;;
+        4) OPENAI_BASE_URL="https://dashscope-intl.aliyuncs.com/compatible-mode/v1" ; OPENAI_MODEL="qwen-max" ;;
+        5) read -r -p "    Base URL: " OPENAI_BASE_URL
+           read -r -p "    Model:    " OPENAI_MODEL ;;
+        "") OPENAI_BASE_URL="$prev_base" ; OPENAI_MODEL="$prev_model" ;;
+        *)  die "expected 1-5 (got '$preset')" ;;
+    esac
+    [[ -n "$OPENAI_BASE_URL" && -n "$OPENAI_MODEL" ]] \
+        || die "OPENAI_BASE_URL and OPENAI_MODEL must both be set"
+
+    # Allow tweaking the model after a preset (Gemini variants, Kimi sizes).
+    read -r -p "  Override model? [Enter to keep '$OPENAI_MODEL']: " m_override
+    [[ -n "$m_override" ]] && OPENAI_MODEL="$m_override"
+
+    # API key — re-use Keychain entry if one exists.
+    existing_oai="$(security find-generic-password -s daily-digest-openai -w 2>/dev/null || true)"
+    if [[ -n "$existing_oai" ]]; then
+        read -r -p "  API key already in Keychain — reuse it? [Y/n] " reuse_oai
+        if [[ "$reuse_oai" =~ ^[Nn] ]]; then
+            existing_oai=""
+        fi
+    fi
+    if [[ -z "$existing_oai" ]]; then
+        read -r -s -p "  API key for $OPENAI_BASE_URL (hidden): " OPENAI_API_KEY; echo
+        [[ -n "$OPENAI_API_KEY" ]] || die "API key can't be empty"
+    else
+        OPENAI_API_KEY="$existing_oai"
+    fi
+    ok "provider: $OPENAI_BASE_URL  model: $OPENAI_MODEL"
+fi
 
 # ---------------------------------------------------------------------------
 # 3. Validate
@@ -129,6 +241,42 @@ except Exception as e:
     sys.stderr.write(str(e) + "\n"); sys.exit(1)
 PY
 ok "Gmail IMAP login works"
+
+if [[ "$BACKEND" != "ollama" ]]; then
+    # --- Hosted backend: skip Ollama install entirely; just smoke-test
+    say "Smoke-testing hosted backend"
+    OPENAI_BASE_URL_FOR_PY="$OPENAI_BASE_URL" \
+    OPENAI_API_KEY_FOR_PY="$OPENAI_API_KEY" \
+    OPENAI_MODEL_FOR_PY="$OPENAI_MODEL" \
+    "$PYTHON" - <<'PY' || die "Hosted backend ping failed — check API key, base URL, and model name."
+import json, os, sys, urllib.request, urllib.error
+base = os.environ["OPENAI_BASE_URL_FOR_PY"].rstrip("/")
+body = {
+    "model": os.environ["OPENAI_MODEL_FOR_PY"],
+    "messages": [{"role":"user","content":"ping"}],
+    "max_tokens": 4,
+    "stream": False,
+}
+req = urllib.request.Request(
+    f"{base}/chat/completions",
+    data=json.dumps(body).encode("utf-8"),
+    headers={
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {os.environ['OPENAI_API_KEY_FOR_PY']}",
+    },
+    method="POST",
+)
+try:
+    with urllib.request.urlopen(req, timeout=60) as r:
+        r.read()
+except urllib.error.HTTPError as e:
+    body = e.read().decode("utf-8", errors="replace")[:400]
+    sys.stderr.write(f"HTTP {e.code} {e.reason}: {body}\n"); sys.exit(1)
+except Exception as e:
+    sys.stderr.write(str(e) + "\n"); sys.exit(1)
+PY
+    ok "Hosted backend responds"
+else
 
 # --- Ollama: detect, install if missing, start if stopped, pull model ----
 # Only auto-install/start when OLLAMA_URL is this machine. For a remote
@@ -273,8 +421,10 @@ except (urllib.error.URLError, TimeoutError) as e:
 PY
 ok "Ollama chat endpoint responds"
 
+fi  # end of Ollama-only validation block
+
 # ---------------------------------------------------------------------------
-# 4. Store the Gmail app password in Keychain
+# 4. Store the Gmail app password in Keychain (and OpenAI key if hosted)
 # ---------------------------------------------------------------------------
 say "Storing Gmail app password in login Keychain"
 # -U updates if it already exists
@@ -284,10 +434,28 @@ security add-generic-password -U \
     -j "Gmail IMAP app password used by daily-digest"
 ok "stored Gmail app password"
 
+if [[ "$BACKEND" == "openai_compatible" ]]; then
+    security add-generic-password -U \
+        -a "api-key" -s "daily-digest-openai" \
+        -T "" -w "$OPENAI_API_KEY" \
+        -j "API key for the hosted backend used by daily-digest"
+    ok "stored hosted-backend API key in Keychain entry 'daily-digest-openai'"
+fi
+
 # Anthropic key is no longer used — remove any leftover from a prior install.
 if security find-generic-password -s daily-digest-anthropic >/dev/null 2>&1; then
     security delete-generic-password -s daily-digest-anthropic 2>/dev/null || true
     ok "removed obsolete Anthropic Keychain entry from a previous install"
+fi
+# If user just switched from openai_compatible → ollama, remove the
+# now-orphan API key so it doesn't sit around in Keychain unnecessarily.
+if [[ "$BACKEND" == "ollama" ]] \
+    && security find-generic-password -s daily-digest-openai >/dev/null 2>&1; then
+    read -r -p "  Found a daily-digest-openai key in Keychain but you picked ollama. Remove it? [Y/n] " rm_oai
+    if [[ ! "$rm_oai" =~ ^[Nn] ]]; then
+        security delete-generic-password -s daily-digest-openai 2>/dev/null || true
+        ok "removed daily-digest-openai Keychain entry"
+    fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -432,13 +600,24 @@ DIGEST_USE_MAIL_APP="$USE_MAIL_APP"
 DIGEST_USE_IMESSAGE="$USE_IMESSAGE"
 DIGEST_IMESSAGE_DAYS="3"
 
+# Backend: 'ollama' (local, default) or 'openai_compatible' (hosted —
+# DeepSeek, Moonshot/Kimi, Gemini OpenAI-compat, DashScope, etc.).
+DIGEST_BACKEND="$BACKEND"
+
 # Local LLM backend (Ollama). Default URL is localhost; point somewhere
 # else on your LAN if you run Ollama on a separate beefier machine.
-OLLAMA_URL="$OLLAMA_URL"
-OLLAMA_MODEL="$OLLAMA_MODEL"
+OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434}"
+OLLAMA_MODEL="${OLLAMA_MODEL:-llama3.1:8b}"
 # Max seconds to wait for a completion. Cold starts on large models
 # can easily take minutes — raise this if you see timeouts.
 OLLAMA_TIMEOUT="600"
+
+# Hosted backend (only used when DIGEST_BACKEND=openai_compatible).
+# OPENAI_API_KEY is NOT stored here — run.sh pulls it from Keychain
+# entry 'daily-digest-openai'.
+OPENAI_BASE_URL="$OPENAI_BASE_URL"
+OPENAI_MODEL="$OPENAI_MODEL"
+OPENAI_TIMEOUT="300"
 EOF
 chmod 600 "$CONFIG_FILE"
 ok "config written (use_mail_app=$USE_MAIL_APP use_imessage=$USE_IMESSAGE model=$OLLAMA_MODEL)"
