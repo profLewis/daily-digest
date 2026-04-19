@@ -60,6 +60,15 @@ CFG = {
     "ollama_model": os.environ.get("OLLAMA_MODEL", "llama3.1:8b"),
     "ollama_timeout": int(os.environ.get("OLLAMA_TIMEOUT", "600")),
     "calendar_days": int(os.environ.get("DIGEST_CAL_DAYS", "14")),
+    # Calendar.app via AppleScript can be slow when many calendars are
+    # synced (iCloud/Google/subscribed). Real-world timings: ~70s on a
+    # quiet morning, 2-3 minutes when Calendar is busy syncing. Default
+    # 600s gives plenty of headroom; bump higher with DIGEST_CAL_TIMEOUT
+    # if you hit it.
+    "calendar_timeout": int(os.environ.get("DIGEST_CAL_TIMEOUT", "600")),
+    # Mail.app AppleScript walks every account's INBOX. Same story —
+    # large mailboxes can take minutes.
+    "mail_app_timeout": int(os.environ.get("DIGEST_MAIL_APP_TIMEOUT", "600")),
     "email_days": int(os.environ.get("DIGEST_EMAIL_DAYS", "3")),
     "keep_days": int(os.environ.get("DIGEST_KEEP_DAYS", "1")),
     "use_mail_app": os.environ.get("DIGEST_USE_MAIL_APP", "false").lower() == "true",
@@ -303,11 +312,24 @@ def _build_title_html(title: str, gcal_url: str, calshow: str) -> str:
 
 
 def fetch_calendar(days: int) -> list[CalEvent]:
-    log.info("reading calendar (%d days ahead)", days)
-    res = subprocess.run(
-        ["osascript", "-e", APPLESCRIPT_CAL, str(days)],
-        capture_output=True, text=True, timeout=180,
-    )
+    log.info("reading calendar (%d days ahead, timeout=%ds)",
+             days, CFG["calendar_timeout"])
+    t0 = dt.datetime.now()
+    try:
+        res = subprocess.run(
+            ["osascript", "-e", APPLESCRIPT_CAL, str(days)],
+            capture_output=True, text=True, timeout=CFG["calendar_timeout"],
+        )
+    except subprocess.TimeoutExpired:
+        log.error(
+            "calendar AppleScript timed out after %ds. Calendar.app is slow "
+            "or unresponsive. Try: open Calendar.app and let it finish syncing, "
+            "or raise DIGEST_CAL_TIMEOUT in ~/.config/daily-digest/config.env.",
+            CFG["calendar_timeout"],
+        )
+        return []
+    elapsed = (dt.datetime.now() - t0).total_seconds()
+    log.info("calendar: AppleScript returned in %.1fs", elapsed)
     if res.returncode != 0:
         log.error("osascript failed: %s", res.stderr)
         return []
@@ -498,11 +520,24 @@ end clean
 """
 
 def fetch_mail_app(days: int) -> list[MailItem]:
-    log.info("mail.app: AppleScript read of inbox messages (last %d days)", days)
-    res = subprocess.run(
-        ["osascript", "-e", APPLESCRIPT_MAIL, str(days)],
-        capture_output=True, text=True, timeout=300,
-    )
+    log.info("mail.app: AppleScript read of inbox messages (last %d days, timeout=%ds)",
+             days, CFG["mail_app_timeout"])
+    t0 = dt.datetime.now()
+    try:
+        res = subprocess.run(
+            ["osascript", "-e", APPLESCRIPT_MAIL, str(days)],
+            capture_output=True, text=True, timeout=CFG["mail_app_timeout"],
+        )
+    except subprocess.TimeoutExpired:
+        log.error(
+            "mail.app AppleScript timed out after %ds. Either lower "
+            "DIGEST_EMAIL_DAYS or raise DIGEST_MAIL_APP_TIMEOUT in "
+            "~/.config/daily-digest/config.env.",
+            CFG["mail_app_timeout"],
+        )
+        return []
+    elapsed = (dt.datetime.now() - t0).total_seconds()
+    log.info("mail.app: AppleScript returned in %.1fs", elapsed)
     if res.returncode != 0:
         log.error("mail.app osascript failed: %s", res.stderr.strip())
         return []
