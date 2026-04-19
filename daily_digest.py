@@ -676,15 +676,23 @@ def build_digest(cal_events: list[CalEvent],
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_content},
         ],
-        "stream": False,
+        # Stream so we can log incremental progress instead of going silent
+        # for the entire generation (which on an 8B model + a busy day's
+        # input can take a few minutes).
+        "stream": True,
         "options": {
             # Keep it deterministic-ish for day-to-day continuity.
             "temperature": 0.2,
             "num_predict": 4000,
         },
     }
-    log.info("ollama: calling %s at %s (timeout=%ds)",
-             CFG["ollama_model"], CFG["ollama_url"], CFG["ollama_timeout"])
+    prompt_chars = len(SYSTEM_PROMPT) + len(user_content)
+    log.info(
+        "ollama: calling %s at %s (timeout=%ds, prompt=%d chars: "
+        "%d events, %d emails, %d messages)",
+        CFG["ollama_model"], CFG["ollama_url"], CFG["ollama_timeout"],
+        prompt_chars, len(cal_events), len(emails), len(messages),
+    )
     req = urllib.request.Request(
         f"{CFG['ollama_url']}/api/chat",
         data=json.dumps(body).encode("utf-8"),
@@ -692,9 +700,45 @@ def build_digest(cal_events: list[CalEvent],
         method="POST",
     )
     t0 = dt.datetime.now()
+    chunks: list[str] = []
+    final_obj: dict = {}
+    first_token_at: float | None = None
+    last_heartbeat = t0
+    HEARTBEAT_EVERY_S = 10.0
+
     try:
         with urllib.request.urlopen(req, timeout=CFG["ollama_timeout"]) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+            log.info("ollama: connection open, waiting for first token "
+                     "(cold-start model load can take 10-60s)…")
+            # NDJSON: one JSON object per line. Non-final lines carry an
+            # incremental message.content; the final line has done=true and
+            # the timing/token stats but no content.
+            for raw in resp:
+                if not raw.strip():
+                    continue
+                try:
+                    obj = json.loads(raw)
+                except json.JSONDecodeError:
+                    log.warning("ollama: skipping non-JSON line: %r", raw[:200])
+                    continue
+                token = (obj.get("message") or {}).get("content") or ""
+                if token:
+                    if first_token_at is None:
+                        first_token_at = (dt.datetime.now() - t0).total_seconds()
+                        log.info("ollama: first token after %.1fs — generating…",
+                                 first_token_at)
+                    chunks.append(token)
+                if obj.get("done"):
+                    final_obj = obj
+                    break
+                now = dt.datetime.now()
+                if (now - last_heartbeat).total_seconds() >= HEARTBEAT_EVERY_S:
+                    elapsed_s = (now - t0).total_seconds()
+                    chars_so_far = sum(len(c) for c in chunks)
+                    rate = chars_so_far / elapsed_s if elapsed_s > 0 else 0
+                    log.info("ollama: streaming… %d chars in %.0fs (~%.0f chars/s)",
+                             chars_so_far, elapsed_s, rate)
+                    last_heartbeat = now
     except urllib.error.URLError as exc:
         raise RuntimeError(
             f"ollama request failed: {exc}. Is 'ollama serve' running at "
@@ -703,17 +747,24 @@ def build_digest(cal_events: list[CalEvent],
         ) from exc
     elapsed = (dt.datetime.now() - t0).total_seconds()
 
-    html = ((data.get("message") or {}).get("content") or "").strip()
+    html = "".join(chunks).strip()
     stats = {
         "model": CFG["ollama_model"],
-        "input_tokens": int(data.get("prompt_eval_count", 0) or 0),
-        "output_tokens": int(data.get("eval_count", 0) or 0),
+        "input_tokens": int(final_obj.get("prompt_eval_count", 0) or 0),
+        "output_tokens": int(final_obj.get("eval_count", 0) or 0),
         "elapsed_s": elapsed,
     }
+    # load_duration / prompt_eval_duration come back in nanoseconds; convert
+    # to seconds for human-readable logging. They explain where the time
+    # went — useful when the run feels slow.
+    load_s = (final_obj.get("load_duration", 0) or 0) / 1e9
+    prompt_eval_s = (final_obj.get("prompt_eval_duration", 0) or 0) / 1e9
+    eval_s = (final_obj.get("eval_duration", 0) or 0) / 1e9
     log.info(
-        "ollama: usage model=%s prompt_eval=%d eval=%d elapsed=%.1fs",
-        stats["model"], stats["input_tokens"], stats["output_tokens"],
-        stats["elapsed_s"],
+        "ollama: done — model=%s prompt_eval=%d (%.1fs) eval=%d (%.1fs) "
+        "load=%.1fs total=%.1fs output=%d chars",
+        stats["model"], stats["input_tokens"], prompt_eval_s,
+        stats["output_tokens"], eval_s, load_s, elapsed, len(html),
     )
     return html, stats
 
