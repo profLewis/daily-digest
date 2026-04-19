@@ -58,9 +58,21 @@ CFG = {
     "gmail_app_pw": _require_env("DIGEST_GMAIL_APP_PW"),
     "recipient": os.environ.get("DIGEST_RECIPIENT")
                  or _require_env("DIGEST_GMAIL_ADDRESS"),
+    # Which backend handles the digest generation. "ollama" (default) keeps
+    # everything local; "openai_compatible" sends the prompt to a hosted
+    # endpoint that speaks OpenAI's /v1/chat/completions schema (DeepSeek,
+    # Moonshot/Kimi, Google Gemini's OpenAI-compat endpoint, Alibaba's
+    # DashScope, etc.). Picking openai_compatible reverses the data-locality
+    # guarantee the local Ollama path provides — every email subject,
+    # calendar event and iMessage you feed in leaves your machine.
+    "backend": os.environ.get("DIGEST_BACKEND", "ollama").lower(),
     "ollama_url": os.environ.get("OLLAMA_URL", "http://localhost:11434"),
     "ollama_model": os.environ.get("OLLAMA_MODEL", "llama3.1:8b"),
     "ollama_timeout": int(os.environ.get("OLLAMA_TIMEOUT", "600")),
+    "openai_base_url": os.environ.get("OPENAI_BASE_URL", ""),
+    "openai_model": os.environ.get("OPENAI_MODEL", ""),
+    "openai_api_key": os.environ.get("OPENAI_API_KEY", ""),
+    "openai_timeout": int(os.environ.get("OPENAI_TIMEOUT", "300")),
     "calendar_days": int(os.environ.get("DIGEST_CAL_DAYS", "14")),
     # Calendar.app via AppleScript can be slow when many calendars are
     # synced (iCloud/Google/subscribed). Real-world timings: ~70s on a
@@ -692,9 +704,11 @@ def build_digest(cal_events: list[CalEvent],
                  emails: list[MailItem],
                  messages: list[ChatMessage],
                  yesterday_html: str) -> tuple[str, dict]:
-    """Return (html, stats). stats has input_tokens, output_tokens, and
-    elapsed_s. Token counts come from Ollama's prompt_eval_count and
-    eval_count. Elapsed is wall-clock for the generate call."""
+    """Dispatch to the configured backend (ollama / openai_compatible).
+
+    Returns (html, stats). stats always carries model, input_tokens,
+    output_tokens, and elapsed_s, regardless of which backend ran.
+    """
     payload = {
         "today": dt.date.today().isoformat(),
         "calendar_window_days": CFG["calendar_days"],
@@ -707,6 +721,23 @@ def build_digest(cal_events: list[CalEvent],
         "Here is today's input. Produce the digest as specified.\n\n"
         f"```json\n{json.dumps(payload, indent=2, default=str)}\n```"
     )
+    prompt_chars = len(SYSTEM_PROMPT) + len(user_content)
+    counts = (len(cal_events), len(emails), len(messages))
+
+    backend = CFG["backend"]
+    if backend == "openai_compatible":
+        return _call_openai_compatible(user_content, prompt_chars, counts)
+    if backend == "ollama":
+        return _call_ollama(user_content, prompt_chars, counts)
+    raise RuntimeError(
+        f"unknown DIGEST_BACKEND={backend!r}; expected 'ollama' or "
+        "'openai_compatible'"
+    )
+
+
+def _call_ollama(user_content: str, prompt_chars: int,
+                 counts: tuple[int, int, int]) -> tuple[str, dict]:
+    n_events, n_emails, n_messages = counts
     body = {
         "model": CFG["ollama_model"],
         "messages": [
@@ -723,12 +754,11 @@ def build_digest(cal_events: list[CalEvent],
             "num_predict": 4000,
         },
     }
-    prompt_chars = len(SYSTEM_PROMPT) + len(user_content)
     log.info(
         "ollama: calling %s at %s (timeout=%ds, prompt=%d chars: "
         "%d events, %d emails, %d messages)",
         CFG["ollama_model"], CFG["ollama_url"], CFG["ollama_timeout"],
-        prompt_chars, len(cal_events), len(emails), len(messages),
+        prompt_chars, n_events, n_emails, n_messages,
     )
     req = urllib.request.Request(
         f"{CFG['ollama_url']}/api/chat",
@@ -828,6 +858,175 @@ def build_digest(cal_events: list[CalEvent],
         "load=%.1fs total=%.1fs output=%d chars",
         stats["model"], stats["input_tokens"], prompt_eval_s,
         stats["output_tokens"], eval_s, load_s, elapsed, len(html),
+    )
+    return html, stats
+
+
+def _call_openai_compatible(user_content: str, prompt_chars: int,
+                            counts: tuple[int, int, int]) -> tuple[str, dict]:
+    """Call any OpenAI-compatible /v1/chat/completions endpoint.
+
+    Works for DeepSeek, Moonshot/Kimi, Google Gemini's OpenAI-compat
+    endpoint, Alibaba DashScope, and others that implement the OpenAI
+    chat-completions schema (including SSE streaming with
+    `data: {...}` lines terminated by `data: [DONE]`).
+    """
+    n_events, n_emails, n_messages = counts
+    if not CFG["openai_api_key"]:
+        raise RuntimeError(
+            "DIGEST_BACKEND=openai_compatible but OPENAI_API_KEY is empty. "
+            "run.sh should pull the key from Keychain entry 'daily-digest-openai'."
+        )
+    if not CFG["openai_base_url"] or not CFG["openai_model"]:
+        raise RuntimeError(
+            "DIGEST_BACKEND=openai_compatible requires OPENAI_BASE_URL and "
+            "OPENAI_MODEL in ~/.config/daily-digest/config.env."
+        )
+
+    # Loud, every-run reminder that personal content is leaving the host.
+    log.warning(
+        "BACKEND=openai_compatible — sending %d chars of email/calendar/"
+        "message content to %s (model=%s). This data leaves your machine. "
+        "Set DIGEST_BACKEND=ollama to keep everything local.",
+        prompt_chars, CFG["openai_base_url"], CFG["openai_model"],
+    )
+
+    body = {
+        "model": CFG["openai_model"],
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ],
+        "stream": True,
+        # Many providers honour stream_options.include_usage; the rest
+        # ignore it harmlessly.
+        "stream_options": {"include_usage": True},
+        "temperature": 0.2,
+        "max_tokens": 4000,
+    }
+    log.info(
+        "openai: calling %s at %s (timeout=%ds, prompt=%d chars: "
+        "%d events, %d emails, %d messages)",
+        CFG["openai_model"], CFG["openai_base_url"], CFG["openai_timeout"],
+        prompt_chars, n_events, n_emails, n_messages,
+    )
+    endpoint = f"{CFG['openai_base_url'].rstrip('/')}/chat/completions"
+    req = urllib.request.Request(
+        endpoint,
+        data=json.dumps(body).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {CFG['openai_api_key']}",
+            "Accept": "text/event-stream",
+        },
+        method="POST",
+    )
+
+    t0 = dt.datetime.now()
+    chunks: list[str] = []
+    usage: dict = {}
+    first_token_at: float | None = None
+    last_heartbeat = t0
+    lines_seen = 0
+    bytes_seen = 0
+    HEARTBEAT_EVERY_S = 10.0
+
+    log.info("openai: opening POST %s", endpoint)
+    try:
+        with urllib.request.urlopen(req, timeout=CFG["openai_timeout"]) as resp:
+            te = resp.getheader("Transfer-Encoding") or "(none)"
+            ct = resp.getheader("Content-Type") or "(none)"
+            log.info(
+                "openai: connection open (HTTP %s, Transfer-Encoding=%s, "
+                "Content-Type=%s) — reading SSE stream…",
+                resp.status, te, ct,
+            )
+            while True:
+                raw = resp.readline()
+                if not raw:
+                    break
+                lines_seen += 1
+                bytes_seen += len(raw)
+                line = raw.strip()
+                if not line:
+                    continue
+                # SSE protocol: ignore everything that isn't a data: line
+                # (comments start with ':', event/id lines aren't relevant).
+                if not line.startswith(b"data:"):
+                    continue
+                payload_raw = line[len(b"data:"):].lstrip()
+                if payload_raw == b"[DONE]":
+                    break
+                try:
+                    obj = json.loads(payload_raw)
+                except json.JSONDecodeError:
+                    log.warning("openai: skipping non-JSON SSE: %r",
+                                payload_raw[:200])
+                    continue
+                # Token text lives in choices[0].delta.content per the
+                # chat.completion.chunk schema.
+                choices = obj.get("choices") or []
+                if choices:
+                    delta = choices[0].get("delta") or {}
+                    token = delta.get("content") or ""
+                    if token:
+                        if first_token_at is None:
+                            first_token_at = (dt.datetime.now() - t0).total_seconds()
+                            log.info("openai: first token after %.1fs — generating…",
+                                     first_token_at)
+                        chunks.append(token)
+                # Final chunk often carries usage; OpenAI sends a
+                # zero-choice chunk with usage when include_usage=True.
+                if obj.get("usage"):
+                    usage = obj["usage"]
+                now = dt.datetime.now()
+                if (now - last_heartbeat).total_seconds() >= HEARTBEAT_EVERY_S:
+                    elapsed_s = (now - t0).total_seconds()
+                    chars_so_far = sum(len(c) for c in chunks)
+                    rate = chars_so_far / elapsed_s if elapsed_s > 0 else 0
+                    log.info("openai: streaming… %d chars in %.0fs (~%.0f chars/s)",
+                             chars_so_far, elapsed_s, rate)
+                    last_heartbeat = now
+            log.info("openai: stream ended (%d lines, %d bytes read)",
+                     lines_seen, bytes_seen)
+    except urllib.error.HTTPError as exc:
+        # HTTPError carries the response body, which usually says exactly
+        # what's wrong (bad key, unknown model, rate limit). Don't lose it.
+        try:
+            body_txt = exc.read().decode("utf-8", errors="replace")[:500]
+        except Exception:
+            body_txt = ""
+        raise RuntimeError(
+            f"openai-compatible request failed: HTTP {exc.code} {exc.reason}"
+            + (f" — {body_txt}" if body_txt else "")
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(
+            f"openai-compatible request failed: {exc}. Check OPENAI_BASE_URL "
+            f"({CFG['openai_base_url']}) is reachable."
+        ) from exc
+
+    elapsed = (dt.datetime.now() - t0).total_seconds()
+    if not chunks:
+        log.error(
+            "openai: stream produced 0 content tokens in %.1fs "
+            "(read %d lines / %d bytes). Check API key, model name, and "
+            "rate-limit / quota status with the provider.",
+            elapsed, lines_seen, bytes_seen,
+        )
+
+    html = "".join(chunks).strip()
+    stats = {
+        "model": CFG["openai_model"],
+        "input_tokens": int(usage.get("prompt_tokens", 0) or 0),
+        "output_tokens": int(usage.get("completion_tokens", 0) or 0),
+        "elapsed_s": elapsed,
+    }
+    log.info(
+        "openai: done — model=%s prompt_tokens=%d completion_tokens=%d "
+        "total=%.1fs output=%d chars",
+        stats["model"], stats["input_tokens"], stats["output_tokens"],
+        elapsed, len(html),
     )
     return html, stats
 
@@ -980,7 +1179,10 @@ def _check_model_freshness() -> None:
     `modified_at` timestamp (= when you last pulled the tag). If it's
     older than DIGEST_MODEL_STALE_DAYS (default 30), emit a warning
     line pointing at update-model.sh. All errors swallowed — this is
-    advisory, never the reason a run fails."""
+    advisory, never the reason a run fails. No-op for non-ollama
+    backends (hosted providers manage versioning on their end)."""
+    if CFG["backend"] != "ollama":
+        return
     threshold_days = int(os.environ.get("DIGEST_MODEL_STALE_DAYS", "30"))
     try:
         req = urllib.request.Request(
@@ -1221,7 +1423,7 @@ def main() -> int:
             "imessages=%d model=%s prompt_eval=%d eval=%d elapsed=%s "
             "emailed=%s dry_run=%s exit=%d",
             cal_n, mail_n, mail_app_n, imsg_n,
-            stats.get("model", CFG["ollama_model"]),
+            stats.get("model", CFG.get("openai_model") or CFG["ollama_model"]),
             stats.get("input_tokens", 0), stats.get("output_tokens", 0),
             elapsed_str, emailed, args.dry_run, rc,
         )
