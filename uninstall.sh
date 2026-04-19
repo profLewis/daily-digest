@@ -13,6 +13,8 @@ CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/daily-digest"
 STATE_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/daily-digest"
 LAUNCHD_LABEL="com.user.dailydigest"
 LAUNCHD_PLIST="$HOME/Library/LaunchAgents/$LAUNCHD_LABEL.plist"
+UPDATE_LABEL="com.user.dailydigest.update"
+UPDATE_PLIST="$HOME/Library/LaunchAgents/$UPDATE_LABEL.plist"
 LOG_DIR="$HOME/Library/Logs"
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 
@@ -43,6 +45,21 @@ if [[ -f "$LAUNCHD_PLIST" ]]; then
     ok "removed $LAUNCHD_PLIST"
 else
     ok "plist not present"
+fi
+
+# The weekly update agent is a separate launchd job installed alongside
+# the main digest agent. Remove it too.
+if launchctl list | grep -q "$UPDATE_LABEL"; then
+    launchctl unload "$UPDATE_PLIST" 2>/dev/null || true
+    ok "unloaded $UPDATE_LABEL"
+else
+    ok "update agent not loaded"
+fi
+if [[ -f "$UPDATE_PLIST" ]]; then
+    rm "$UPDATE_PLIST"
+    ok "removed $UPDATE_PLIST"
+else
+    ok "update plist not present"
 fi
 
 # ---------------------------------------------------------------------------
@@ -99,7 +116,10 @@ if $PURGE; then
     local_removed=0
     for f in "$LOG_DIR/daily-digest.log" \
              "$LOG_DIR/daily-digest.stdout.log" \
-             "$LOG_DIR/daily-digest.stderr.log"; do
+             "$LOG_DIR/daily-digest.stderr.log" \
+             "$LOG_DIR/daily-digest-update.log" \
+             "$LOG_DIR/daily-digest-update.stdout.log" \
+             "$LOG_DIR/daily-digest-update.stderr.log"; do
         if [[ -f "$f" ]]; then
             rm -f "$f"
             local_removed=$((local_removed + 1))

@@ -10,6 +10,8 @@ CONFIG_FILE="$CONFIG_DIR/config.env"
 STATE_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/daily-digest"
 LAUNCHD_LABEL="com.user.dailydigest"
 LAUNCHD_PLIST="$HOME/Library/LaunchAgents/$LAUNCHD_LABEL.plist"
+UPDATE_LABEL="com.user.dailydigest.update"
+UPDATE_PLIST="$HOME/Library/LaunchAgents/$UPDATE_LABEL.plist"
 LOG_DIR="$HOME/Library/Logs"
 
 # Colours (only if stdout is a tty)
@@ -30,7 +32,7 @@ die()  { echo "${R}ERROR:${N} $*" >&2; exit 1; }
 # downloaded only this script (e.g. with curl), point them at git clone
 # rather than failing later with a confusing chmod / sed error.
 missing=()
-for f in run.sh daily_digest.py uninstall.sh; do
+for f in run.sh daily_digest.py uninstall.sh update-model.sh; do
     [[ -f "$REPO_DIR/$f" ]] || missing+=("$f")
 done
 if (( ${#missing[@]} > 0 )); then
@@ -444,8 +446,8 @@ ok "config written (use_mail_app=$USE_MAIL_APP use_imessage=$USE_IMESSAGE model=
 # ---------------------------------------------------------------------------
 # 7. Make scripts executable
 # ---------------------------------------------------------------------------
-chmod +x "$REPO_DIR/run.sh" "$REPO_DIR/daily_digest.py" "$REPO_DIR/uninstall.sh"
-ok "run.sh, daily_digest.py, uninstall.sh marked executable"
+chmod +x "$REPO_DIR/run.sh" "$REPO_DIR/daily_digest.py" "$REPO_DIR/uninstall.sh" "$REPO_DIR/update-model.sh"
+ok "run.sh, daily_digest.py, uninstall.sh, update-model.sh marked executable"
 
 # ---------------------------------------------------------------------------
 # 8. Pick a run time + check for conflicts with other scheduled jobs
@@ -635,6 +637,57 @@ cat > "$LAUNCHD_PLIST" <<EOF
 EOF
 launchctl load "$LAUNCHD_PLIST"
 ok "agent installed and loaded ($LAUNCHD_PLIST)"
+
+# ---------------------------------------------------------------------------
+# 9b. Weekly model-refresh LaunchAgent
+# ---------------------------------------------------------------------------
+# Runs update-model.sh every Sunday at 03:30. That's 'ollama pull
+# $OLLAMA_MODEL', which is idempotent: no-op if the local copy matches
+# upstream, delta download otherwise. Keeps you from silently drifting
+# onto a months-stale tag. Weekday=0 in launchd = Sunday.
+say "Installing weekly model-refresh agent"
+
+if launchctl list | grep -q "$UPDATE_LABEL"; then
+    launchctl unload "$UPDATE_PLIST" 2>/dev/null || true
+    ok "unloaded previous update agent"
+fi
+
+cat > "$UPDATE_PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$UPDATE_LABEL</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>$REPO_DIR/update-model.sh</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key>
+        <integer>0</integer>
+        <key>Hour</key>
+        <integer>3</integer>
+        <key>Minute</key>
+        <integer>30</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>$LOG_DIR/daily-digest-update.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>$LOG_DIR/daily-digest-update.stderr.log</string>
+</dict>
+</plist>
+EOF
+launchctl load "$UPDATE_PLIST"
+ok "update agent installed and loaded ($UPDATE_PLIST) — fires Sundays 03:30"
 
 # ---------------------------------------------------------------------------
 # 10. First run to trigger permission prompts

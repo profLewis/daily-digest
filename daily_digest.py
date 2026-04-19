@@ -24,7 +24,9 @@ import json
 import logging
 import os
 import platform
+import signal
 import smtplib
+import time
 import html as html_mod
 import ssl
 import subprocess
@@ -945,21 +947,168 @@ def send_email(html_body: str) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
+def _check_model_freshness() -> None:
+    """Warn if the active Ollama model hasn't been refreshed in a while.
+
+    Non-fatal. Hits Ollama's /api/show for the local manifest's
+    `modified_at` timestamp (= when you last pulled the tag). If it's
+    older than DIGEST_MODEL_STALE_DAYS (default 30), emit a warning
+    line pointing at update-model.sh. All errors swallowed — this is
+    advisory, never the reason a run fails."""
+    threshold_days = int(os.environ.get("DIGEST_MODEL_STALE_DAYS", "30"))
+    try:
+        req = urllib.request.Request(
+            f"{CFG['ollama_url'].rstrip('/')}/api/show",
+            data=json.dumps({"name": CFG["ollama_model"]}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        log.debug("model freshness check skipped: %s", exc)
+        return
+
+    modified_str = data.get("modified_at") or ""
+    if not modified_str:
+        return
+    try:
+        modified_at = dt.datetime.fromisoformat(modified_str.replace("Z", "+00:00"))
+    except ValueError:
+        return
+    if modified_at.tzinfo is None:
+        modified_at = modified_at.replace(tzinfo=dt.timezone.utc)
+    age_days = (dt.datetime.now(dt.timezone.utc) - modified_at).days
+    script_dir = Path(__file__).parent
+    if age_days >= threshold_days:
+        log.warning(
+            "model %s was last refreshed %d days ago (>= %d). "
+            "Run %s/update-model.sh to pull upstream fixes, or let the "
+            "weekly LaunchAgent handle it.",
+            CFG["ollama_model"], age_days, threshold_days, script_dir,
+        )
+    else:
+        log.info("model %s last refreshed %d days ago (threshold %d)",
+                 CFG["ollama_model"], age_days, threshold_days)
+
+
 def _acquire_single_instance_lock():
     """Stop two copies of daily-digest running at once. Gmail throttles to
     ~15 concurrent IMAP connections per account, and overlapping runs can
-    also corrupt yesterday.html. Returns the held file handle — keep it
-    alive for the duration of the run; Python closing it releases the lock.
-    Returns None if another instance is already running."""
+    also corrupt yesterday.html.
+
+    Returns:
+      - file handle on success (keep it alive; closing releases the lock).
+      - the integer PID of the holding process if another run has the lock.
+      - 0 if the lock is held but the holder's PID can't be parsed
+        (stale-but-alive corner case; treat as busy with unknown PID).
+
+    The file is opened without truncation so the previous holder's PID
+    survives a failed lock attempt — we need it to be able to kill the
+    holder if the user asks us to.
+    """
     lockfile = CFG["state_dir"] / "daily-digest.lock"
+    fd = os.open(lockfile, os.O_RDWR | os.O_CREAT, 0o600)
+    lf = os.fdopen(fd, "r+")
     try:
-        lf = open(lockfile, "w")
         fcntl.flock(lf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        return None
-    lf.write(f"{os.getpid()}\n")
-    lf.flush()
+        lf.seek(0)
+        existing = lf.read().strip()
+        lf.close()
+        try:
+            return int(existing)
+        except ValueError:
+            return 0
+    # Got the lock — overwrite with our own PID.
+    lf.seek(0); lf.truncate()
+    lf.write(f"{os.getpid()}\n"); lf.flush()
     return lf
+
+
+def _process_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # The process exists but is owned by someone else. Either way,
+        # it's there — we shouldn't pretend it isn't.
+        return True
+    return True
+
+
+def _handle_existing_run(other_pid: int, interactive: bool) -> "int | object":
+    """Decide what to do about an in-progress run.
+
+    Returns either a held lock file (success — we killed the holder and
+    grabbed the lock) or an integer exit code to return from main().
+    """
+    if not _process_alive(other_pid):
+        # Stale lock — the previous run died without releasing it.
+        # Just take it.
+        log.warning("found stale lock from PID %d (process gone); reclaiming",
+                    other_pid)
+        try:
+            (CFG["state_dir"] / "daily-digest.lock").unlink()
+        except FileNotFoundError:
+            pass
+        new_lock = _acquire_single_instance_lock()
+        if isinstance(new_lock, int):
+            log.error("could not acquire lock after reclaiming stale lock")
+            return 4
+        return new_lock
+
+    if not interactive:
+        # Non-interactive (launchd, cron) — never kill a running peer
+        # silently. Exit and let the previous run finish.
+        log.error("another daily-digest instance is already running "
+                  "(PID %d); exiting (run interactively to kill it)",
+                  other_pid)
+        return 4
+
+    # Interactive: ask the user.
+    print(f"\nAnother daily-digest run is already in progress (PID {other_pid}).",
+          file=sys.stderr)
+    try:
+        ans = input("Kill it and start a new run? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print(file=sys.stderr)
+        return 4
+    if ans not in ("y", "yes"):
+        log.info("leaving PID %d alone; exiting", other_pid)
+        return 4
+
+    log.info("sending SIGTERM to PID %d", other_pid)
+    try:
+        os.kill(other_pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+
+    # Give it up to 10s to release. AppleScript subprocesses sometimes
+    # take a couple of seconds to wind down; SMTP/IMAP closes are fast.
+    for _ in range(20):
+        time.sleep(0.5)
+        retry = _acquire_single_instance_lock()
+        if not isinstance(retry, int):
+            log.info("lock acquired after killing PID %d", other_pid)
+            return retry
+
+    log.warning("PID %d still holding lock after 10s; sending SIGKILL",
+                other_pid)
+    try:
+        os.kill(other_pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    time.sleep(1)
+    retry = _acquire_single_instance_lock()
+    if isinstance(retry, int):
+        log.error("could not acquire lock even after SIGKILL of PID %d",
+                  other_pid)
+        return 4
+    return retry
 
 
 def main() -> int:
@@ -969,9 +1118,14 @@ def main() -> int:
     args = ap.parse_args()
 
     lock = _acquire_single_instance_lock()
-    if lock is None:
-        log.error("another daily-digest instance is already running; exiting")
-        return 4
+    if isinstance(lock, int):
+        # Lock is held by another process. PID is in `lock` (0 = unknown).
+        result = _handle_existing_run(lock, sys.stdin.isatty())
+        if isinstance(result, int):
+            return result
+        lock = result
+
+    _check_model_freshness()
 
     rc = 0
     stats: dict = {}
