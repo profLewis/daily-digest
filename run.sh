@@ -11,8 +11,15 @@ if [[ ! -f "$CONFIG" ]]; then
     echo "No config at $CONFIG — run ./install.sh first." >&2
     exit 1
 fi
+# `set -a` auto-exports every variable assigned while it's active, so the
+# vars in config.env (OLLAMA_MODEL, OLLAMA_NUM_CTX, DIGEST_CAL_DAYS, etc.)
+# reach the Python child via the environment. Without this, `source`
+# sets shell-local variables that `exec` does NOT inherit — so everything
+# the user sets in config.env is silently ignored and defaults win.
+set -a
 # shellcheck disable=SC1090
 source "$CONFIG"
+set +a
 
 : "${DIGEST_GMAIL_ADDRESS:?DIGEST_GMAIL_ADDRESS missing from $CONFIG}"
 : "${DIGEST_PYTHON:?DIGEST_PYTHON missing from $CONFIG}"
